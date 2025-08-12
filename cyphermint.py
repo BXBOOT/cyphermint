@@ -29,6 +29,7 @@ MEMPOOL_FILE = 'mempool.json'
 UTXO_FILE = 'utxos.json'
 CONSENSUS_ANALYTICS_FILE = 'consensus_analytics.json'
 WITNESS_FILE = 'witness_nodes.json'
+RECENT_DUP_WINDOW = 5
 
 # Cyphermint consensus parameters
 INITIAL_REWARD = 50 * 100000000  # 50 CPM in satoshis
@@ -36,12 +37,136 @@ HALVING_INTERVAL = 210000  # blocks
 DIFFICULTY_ADJUSTMENT_INTERVAL = 2016  # blocks
 TARGET_BLOCK_TIME = 600  # 10 minutes in seconds
 MAX_TARGET = 0x1d00ffff  # Initial difficulty target
+
+
+# --- Orphan/backfill globals & RPC helper ---
+ORPHAN_BLOCKS: Dict[str, Dict] = {}
+BACKFILL_QUEUE: set = set()
+LIVE_PEERS_CACHE = set()
+LIVE_PEERS_LOCK = threading.Lock()
+
+def request_block_by_hash(ip: str, port: int, block_hash: str) -> Optional[Dict]:
+    """Ask a peer for a block by its hash. Returns a block dict or None."""
+    try:
+        with socket.create_connection((ip, port), timeout=5) as s:
+            req = {"type": "get_block_by_hash", "data": {"hash": block_hash}}
+            s.sendall(json.dumps(req).encode())
+            s.shutdown(socket.SHUT_WR)
+            chunks = []
+            while True:
+                part = s.recv(65536)
+                if not part:
+                    break
+                chunks.append(part)
+        if not chunks:
+            return None
+        resp = json.loads(b"".join(chunks).decode())
+        if resp.get("type") == "block_response" and resp.get("data"):
+            return resp["data"]
+    except Exception:
+        return None
+    return None
+
+# ---- Normalization & work helpers ----
+
+def cmd_repair_duplicate_heights() -> None:
+    """
+    One-time chain repair:
+      - builds a contiguous, deduped prefix from genesis using link-first + work preference
+      - writes the repaired chain back to disk atomically
+      - rebuilds the UTXO set
+    """
+    with BLOCKCHAIN_LOCK:
+        chain = load_json(BLOCKCHAIN_FILE, [])
+    before = len(chain)
+    if not chain:
+        print("❌ Empty chain; nothing to repair")
+        return
+
+    # Use your existing normalization helper
+    fixed = sort_and_dedupe_by_index(chain)
+    after = len(fixed)
+
+    if not fixed:
+        print("❌ Repair failed: could not construct a contiguous prefix")
+        return
+
+    # Persist repaired chain
+    with BLOCKCHAIN_LOCK:
+        save_json(BLOCKCHAIN_FILE, fixed)
+
+    # Rebuild UTXOs (works whether your rebuild takes a param or not)
+    try:
+        rebuild_utxo_set(fixed)          # if your signature is rebuild_utxo_set(blockchain)
+    except TypeError:
+        rebuild_utxo_set()               # if your signature is rebuild_utxo_set() with internal load
+
+    tip = fixed[-1]
+    print(f"✅ Repaired chain to contiguous height {tip.get('index')} ({after}/{before} kept)")
+    print("🔧 UTXO set rebuilt")
+
+
+def _block_hash_of(b: Dict) -> str:
+    return b.get('hash') or b.get('block_hash') or ''
+
+def _block_index_of(b: Dict) -> int:
+    try:
+        return int(b.get('index', -1))
+    except Exception:
+        return -1
+
+def _block_prev_hash_of(b: Dict) -> str:
+    return b.get('previous_hash') or b.get('prev_hash') or ''
+
+def _per_block_work(bits: int) -> int:
+    try:
+        target = DifficultyAdjustment.bits_to_target(bits or MAX_TARGET)
+        return (1 << 256) // (target + 1)
+    except Exception:
+        return 0
+
+def sort_and_dedupe_by_index(chain: List[Dict]) -> List[Dict]:
+    """Return a contiguous, deduped prefix of the chain ordered by height.
+    For each height, prefer a candidate that links to the chosen prev; else, highest work.
+    Stop at the first height gap.
+    """
+    if not chain:
+        return []
+    # Group by height
+    by_idx: Dict[int, List[Dict]] = {}
+    for b in chain:
+        idx = _block_index_of(b)
+        if idx >= 0:
+            by_idx.setdefault(idx, []).append(b)
+    if not by_idx:
+        return []
+    heights = sorted(by_idx.keys())
+    start_h = 0 if 0 in by_idx else heights[0]
+    cands0 = by_idx[start_h]
+    chosen0 = max(cands0, key=lambda x: _per_block_work(x.get('bits', MAX_TARGET)))
+    result: List[Dict] = [chosen0]
+    expected_next = _block_index_of(chosen0) + 1
+    for h in heights:
+        if h <= _block_index_of(chosen0):
+            continue
+        if h != expected_next:
+            break
+        candidates = by_idx[h]
+        prev = result[-1]
+        linked = [c for c in candidates if _block_prev_hash_of(c) == _block_hash_of(prev)]
+        if linked:
+            chosen = max(linked, key=lambda x: _per_block_work(x.get('bits', MAX_TARGET)))
+        else:
+            chosen = max(candidates, key=lambda x: _per_block_work(x.get('bits', MAX_TARGET)))
+        result.append(chosen)
+        expected_next += 1
+    return result
 BUFFER_SIZE = 65536
 
 CONNECTION_TIMEOUT = 30
 PEER_TIMEOUT = 15
 BROADCAST_TIMEOUT = 10
-BASE_PEER_BROADCAST_INTERVAL = 300
+BASE_PEER_BROADCAST_INTERVAL = 600
 MINING_SYNC_INTERVAL = 1
 
 # Consensus parameters
@@ -77,6 +202,38 @@ from typing import Set
 LOCAL_IPS: Set[str] = set()
 
 # Additional missing functions that need to be defined
+def validate_chain_indices_match_positions(chain: List[Dict]) -> bool:
+    """Ensure each block's index field matches its position in the chain"""
+    for i, block in enumerate(chain):
+        if block.get('index') != i:
+            print(f"❌ Block at position {i} has index {block.get('index')} - INVALID CHAIN")
+            return False
+    return True
+
+def validate_blockchain_indices(chain: List[Dict]) -> bool:
+    """Validate that blockchain has no duplicate indices and proper sequence"""
+    if not chain:
+        return True
+    
+    # Check first block is genesis
+    if chain[0]['index'] != 0:
+        print(f"❌ Chain doesn't start with genesis block")
+        return False
+    
+    # Check each block has correct index
+    for i, block in enumerate(chain):
+        if block['index'] != i:
+            print(f"❌ Block at position {i} has index {block['index']}")
+            return False
+    
+    # Check no duplicate indices
+    indices = [block['index'] for block in chain]
+    if len(indices) != len(set(indices)):
+        print(f"❌ Duplicate block indices found")
+        return False
+    
+    return True
+
 def create_safe_socket():
     """Create a socket with proper settings"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -267,6 +424,12 @@ PEERS_LOCK = threading.RLock()
 CONSENSUS_LOCK = threading.RLock()
 ANALYTICS_LOCK = threading.RLock()
 WITNESS_LOCK = threading.RLock()
+
+# --- Orphan/Backfill globals ---
+ORPHAN_BLOCKS = ORPHAN_BLOCKS if 'ORPHAN_BLOCKS' in globals() else {}
+BACKFILL_QUEUE = BACKFILL_QUEUE if 'BACKFILL_QUEUE' in globals() else set()
+
+
 
 # Connection pool management
 ACTIVE_CONNECTIONS = {}
@@ -953,8 +1116,6 @@ class ChainSwitchTracker:
         self.save_history()
         print(f"📊 Chain switch recorded: {old_height} → {new_height} (improvement: {new_height - old_height})")
 
-# Initialize global tracker
-chain_switch_tracker = ChainSwitchTracker(CHAIN_SWITCH_DAMPENING)
 
 class ReorgProtection:
     """Protect against deep reorgs that exchanges hate"""
@@ -1768,7 +1929,7 @@ class CypherMintValidator:
                         break
                 
                 if not utxo_found:
-                   return False, f"UTXO not found for input {inp['txid']}:{inp.get('index', inp.get('vout', 0))}"
+                    return False, f"UTXO not found for input {inp['txid']}:{inp.get('index', inp.get('vout', 0))}"
             
             # Calculate output amount
             output_amount = sum(out['amount'] for out in transaction['outputs'])
@@ -1847,6 +2008,8 @@ class ProductionValidator:
         # Basic block validation first
         if not CypherMintValidator.validate_block_header(new_block, existing_chain[-1]):
             return False
+        
+
         
         # Duplicate transaction handling based on block height
         if new_block['index'] > DUPLICATE_CLEANUP_HEIGHT:
@@ -1929,7 +2092,148 @@ class ProductionValidator:
             print(f"❌ Legacy validation error: {e}")
             return False
 
-# Part 5: Core Blockchain Functions
+# Add to cyphermint.py
+
+class BlockHeader:
+    """Lightweight block header for fast sync"""
+    @staticmethod
+    def extract_header(block: Dict) -> Dict:
+        """Extract just the header from a full block"""
+        return {
+            'version': block.get('version', 1),
+            'index': block['index'],
+            'timestamp': block['timestamp'],
+            'previous_hash': block['previous_hash'],
+            'merkle_root': block['merkle_root'],
+            'bits': block['bits'],
+            'nonce': block['nonce'],
+            'hash': block['hash']
+        }
+    
+    @staticmethod
+    def validate_header_chain(headers: List[Dict]) -> bool:
+        """Validate a chain of headers (much faster than full validation)"""
+        if not headers:
+            return False
+            
+        # Check genesis
+        if headers[0]['index'] != 0 or headers[0]['previous_hash'] != '0' * 64:
+            return False
+            
+        # Validate each header
+        for i in range(1, len(headers)):
+            curr = headers[i]
+            prev = headers[i-1]
+            
+            # Check sequence
+            if curr['index'] != prev['index'] + 1:
+                return False
+                
+            # Check previous hash link
+            if curr['previous_hash'] != prev['hash']:
+                return False
+                
+            # Verify PoW
+            target = DifficultyAdjustment.bits_to_target(curr['bits'])
+            if int(curr['hash'], 16) >= target:
+                return False
+                
+        return True
+
+def sync_headers_first(peer_ip: str, peer_port: int) -> Optional[List[Dict]]:
+    """Download headers first, then full blocks"""
+    try:
+        sock = create_safe_connection(peer_ip, peer_port, timeout=30)
+        if not sock:
+            return None
+            
+        # Step 1: Get all headers
+        print(f"📊 Downloading headers from {peer_ip}...")
+        request = {'type': 'get_headers', 'data': {'start_height': 0}}
+        sock.sendall(json.dumps(request).encode())
+        
+        # Receive headers (much smaller than full blocks)
+        chunks = []
+        sock.settimeout(60)
+        while True:
+            try:
+                chunk = sock.recv(BUFFER_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            except socket.timeout:
+                break
+                
+        if not chunks:
+            return None
+            
+        data = b''.join(chunks)
+        response = json.loads(data.decode())
+        
+        if response.get('type') != 'headers_response':
+            return None
+            
+        headers = response.get('data', [])
+        print(f"📊 Received {len(headers)} headers")
+        
+        # Step 2: Validate headers chain
+        if not BlockHeader.validate_header_chain(headers):
+            print("❌ Invalid header chain")
+            return None
+            
+        # Step 3: Download full blocks in chunks (simple sequential for now)
+        blockchain = []
+        chunk_size = 100
+        
+        for i in range(0, len(headers), chunk_size):
+            end = min(i + chunk_size, len(headers))
+            print(f"📦 Downloading blocks {i}-{end}...")
+            
+            request = {
+                'type': 'get_blocks_range',
+                'data': {'start': i, 'end': end}
+            }
+            sock.sendall(json.dumps(request).encode())
+            
+            chunks = []
+            sock.settimeout(30)
+            while True:
+                try:
+                    chunk = sock.recv(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                except socket.timeout:
+                    break
+                    
+            if chunks:
+                block_data = b''.join(chunks)
+                block_response = json.loads(block_data.decode())
+                if block_response.get('type') == 'blocks_range':
+                    blocks = block_response.get('data', [])
+                    blockchain.extend(blocks)
+                    
+            time.sleep(0.1)  # Small delay between chunks
+        
+        sock.close()
+        
+        # Verify we got all blocks
+        if len(blockchain) == len(headers):
+            print(f"✅ Successfully downloaded {len(blockchain)} blocks")
+            return blockchain
+        else:
+            print(f"❌ Block download incomplete: {len(blockchain)}/{len(headers)}")
+            return None
+        
+    except Exception as e:
+        print(f"Header sync error: {e}")
+        return None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
 
 class ConsensusHealing:
     """Automatic consensus healing for production networks"""
@@ -2025,47 +2329,89 @@ class ConsensusHealing:
     
     @staticmethod
     def download_peer_chain(ip: str, port: int) -> Optional[List[Dict]]:
-        """Download complete blockchain from a peer"""
+        """Download blockchain in chunks to handle large chains"""
         try:
             sock = create_safe_connection(ip, port, timeout=30)
             if not sock:
                 return None
             
-            request = {'type': 'get_chain'}
+            # First, get the chain height
+            request = {'type': 'get_info'}
             sock.sendall(json.dumps(request).encode())
+            sock.settimeout(10)
             
-            chunks = []
-            sock.settimeout(60)
-            
-            while True:
-                try:
-                    chunk = sock.recv(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                except socket.timeout:
-                    break
-            
-            if chunks:
-                data = b''.join(chunks)
-                message = json.loads(data.decode())
+            data = sock.recv(BUFFER_SIZE)
+            if not data:
+                return None
                 
-                if message.get('type') == 'full_chain':
-                    peer_chain = message.get('data', [])
-                    if is_valid_chain(peer_chain):
-                        return peer_chain
+            info = json.loads(data.decode())
+            if info.get('type') != 'info_response':
+                return None
+                
+            chain_height = info.get('data', {}).get('height', 0)
+            if chain_height == 0:
+                return None
+                
+            print(f"📊 Peer {ip} has chain height: {chain_height}")
             
-            return None
+            # Download in chunks of 100 blocks
+            blockchain = []
+            chunk_size = 100
             
+            for start_height in range(0, chain_height, chunk_size):
+                end_height = min(start_height + chunk_size, chain_height)
+                
+                # Request specific block range
+                chunk_request = {
+                    'type': 'get_blocks_range',
+                    'data': {
+                        'start': start_height,
+                        'end': end_height
+                    }
+                }
+                
+                sock.sendall(json.dumps(chunk_request).encode())
+                
+                chunks = []
+                sock.settimeout(30)
+                
+                while True:
+                    try:
+                        chunk = sock.recv(BUFFER_SIZE)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    except socket.timeout:
+                        break
+                
+                if chunks:
+                    chunk_data = b''.join(chunks)
+                    try:
+                        response = json.loads(chunk_data.decode())
+                        if response.get('type') == 'blocks_range':
+                            blocks = response.get('data', [])
+                            blockchain.extend(blocks)
+                            print(f"📦 Downloaded blocks {start_height}-{end_height} ({len(blocks)} blocks)")
+                    except json.JSONDecodeError:
+                        print(f"❌ Failed to parse chunk {start_height}-{end_height}")
+                        return None
+                
+                # Small delay between chunks
+                time.sleep(0.1)
+            
+            sock.close()
+            
+            if len(blockchain) == chain_height and is_valid_chain(blockchain):
+                print(f"✅ Successfully downloaded {len(blockchain)} blocks from {ip}")
+                return blockchain
+            else:
+                print(f"❌ Downloaded chain incomplete or invalid")
+                return None
+                
         except Exception as e:
             print(f"Error downloading chain from {ip}:{port}: {e}")
             return None
-        finally:
-            try:
-                sock.close()
-            except:
-                pass
-
+    
 # Integration Functions
 def enhanced_validate_and_add_block(new_block: Dict, current_chain: List[Dict]) -> bool:
     """Enhanced block validation using production validator with witness weights"""
@@ -2076,7 +2422,7 @@ def enhanced_validate_and_add_block(new_block: Dict, current_chain: List[Dict]) 
         expected_index = len(current_chain)
         
         if new_block['index'] == expected_index:
-            # Use production validation
+    # Use production validation
             if ProductionValidator.validate_block_production(new_block, current_chain):
                 with BLOCKCHAIN_LOCK:
                     fresh_chain = load_json(BLOCKCHAIN_FILE, [])
@@ -2085,20 +2431,40 @@ def enhanced_validate_and_add_block(new_block: Dict, current_chain: List[Dict]) 
                         save_json(BLOCKCHAIN_FILE, fresh_chain)
                         
                         with UTXO_LOCK:
-                           safe_update_utxos(new_block)
-                       
+                            safe_update_utxos(new_block)
+                    
                         # Update witness node validation count
                         witness_node.update_validation_count(new_block['index'])
                         witness_node.save_witness_data()
-                       
+                    
                         # Update checkpoint if this is a checkpoint block
                         update_checkpoint(new_block)
-                       
+                        
+                        # CRITICAL FIX: Remove confirmed transactions from mempool
+                        mempool = load_json(MEMPOOL_FILE, [])
+                        confirmed_tx_ids = set()
+                        
+                        # Get all transaction IDs from the accepted block
+                        for tx in new_block.get('transactions', []):
+                            tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                            confirmed_tx_ids.add(tx_id)
+                        
+                        # Remove confirmed transactions from mempool
+                        remaining_mempool = []
+                        for mem_tx in mempool:
+                            mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
+                            if mem_tx_id not in confirmed_tx_ids:
+                                remaining_mempool.append(mem_tx)
+                        
+                        save_json(MEMPOOL_FILE, remaining_mempool)
+                        print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
+                    
                         print(f"✅ Block {new_block['index']} validated and added (production rules)")
                         return True
-                    else:
-                        print(f"❌ Block {new_block['index']} failed production validation")
-                        return False
+
+            else:
+                print(f"❌ Block {new_block['index']} failed production validation")
+                return False
        
         return False
        
@@ -2231,13 +2597,10 @@ def get_canonical_peer_address(ip: str, connection_port: int) -> Tuple[str, int]
 
 def discover_bootstrap_peers() -> List[Tuple[str, int]]:
     """
-    Enhanced bootstrap discovery – try all hardcoded nodes as both seeds and peers.
-
-    This function iterates through a list of bootstrap candidates, connects to
-    each reachable seed, and requests its peer list.  It skips dialing
-    addresses that correspond to this node (see :func:`is_self_peer`).
-    Discovered peers are canonicalized and returned as a list.  Self
-    addresses are never included in the returned list.
+    Enhanced bootstrap discovery – try ALL hardcoded nodes and collect ALL peers.
+    
+    This function connects to ALL reachable seeds and collects their peer lists,
+    creating a comprehensive view of the network instead of stopping at the first success.
     """
     bootstrap_candidates = [
         ('3.149.130.220', 8334),  # Server 1
@@ -2246,40 +2609,55 @@ def discover_bootstrap_peers() -> List[Tuple[str, int]]:
         ('108.168.27.45', 8334),  # Local machine
     ]
 
-    live_peers: Set[Tuple[str, int]] = set()
+    all_discovered_peers: Set[Tuple[str, int]] = set()
+    successful_seeds = 0
+    
+    print("🔍 Starting comprehensive bootstrap discovery...")
+    
     for ip, port in bootstrap_candidates:
         # Avoid dialing our own address
         if is_self_peer(ip):
             continue
+            
+        print(f"📡 Attempting to connect to bootstrap node {ip}:{port}...")
         sock = create_safe_connection(ip, port, timeout=10)
+        
         if sock:
             try:
-                # Record that this seed responded
-                live_peers.add((ip, port))
+                # This seed is alive, add it to discovered peers
+                all_discovered_peers.add((ip, port))
+                successful_seeds += 1
+                
                 # Request its peer list
                 request = {'type': 'get_peers'}
                 sock.sendall(json.dumps(request).encode())
                 sock.settimeout(10)
                 data = sock.recv(BUFFER_SIZE)
+                
                 if data:
                     message = json.loads(data.decode())
                     if message.get('type') == 'peer_list':
                         peer_list = message.get('data', [])
+                        peers_added = 0
+                        
                         for peer_ip, peer_port in peer_list:
                             canonical_peer = get_canonical_peer_address(peer_ip, peer_port)
                             # Skip our own address to prevent self-dialing
                             if not is_self_peer(canonical_peer[0]):
-                                live_peers.add(canonical_peer)
-                        print(f"📡 Bootstrap discovery: Found {len(peer_list)} peers from {ip}:{port}")
+                                all_discovered_peers.add(canonical_peer)
+                                peers_added += 1
+                                
+                        print(f"✅ Bootstrap {ip}:{port}: Found {peers_added} unique peers")
+                        
             except Exception as e:
-                print(f"🔍 Bootstrap discovery failed for {ip}:{port}: {e}")
+                print(f"⚠️  Bootstrap discovery error for {ip}:{port}: {e}")
             finally:
                 close_safe_connection(sock, ip, port)
         else:
-            print(f"🚫 Bootstrap node {ip}:{port} unreachable")
+            print(f"❌ Bootstrap node {ip}:{port} unreachable")
 
-    final_peer_list = list(live_peers)
-    print(f"🌐 Bootstrap discovery complete: {len(final_peer_list)} live peers found")
+    final_peer_list = list(all_discovered_peers)
+    print(f"🌐 Bootstrap discovery complete: {successful_seeds} seeds responded, {len(final_peer_list)} total unique peers found")
 
     # Update geographic distribution
     if final_peer_list:
@@ -2347,14 +2725,51 @@ def resilient_peer_discovery():
                                close_safe_connection(sock, canonical_peer[0], canonical_peer[1])
                    
                    # Update peer list with live peers
+                   # ---- replace your "Update peer list with live peers" block ----
+                    # Keep a union of known + live + hardcoded seeds, but only broadcast live
                    if live_peers:
-                       updated_peer_list = list(live_peers)
-                       # Sanitize and compare sizes
-                       clean_peers = sanitize_peer_list(updated_peer_list)
-                       if len(clean_peers) != len(current_peers):
-                           with PEERS_LOCK:
-                               save_json(PEERS_FILE, clean_peers)
-                           print(f"🌐 Peer discovery updated: {len(clean_peers)} live peers")
+                        # Update live peer cache for broadcasting and API use
+                        global LIVE_PEERS_CACHE
+                        with LIVE_PEERS_LOCK:
+                            # avoid rebinding to keep thread-safety simple
+                            try:
+                                LIVE_PEERS_CACHE.clear()
+                            except NameError:
+                                pass
+                            try:
+                                LIVE_PEERS_CACHE.update(live_peers)
+                            except NameError:
+                                # define on first run
+                                LIVE_PEERS_CACHE = set(live_peers)
+
+                        # Persist the union so we don't forget offline peers
+                        with PEERS_LOCK:
+                            current_peers = load_json(PEERS_FILE, [])
+                            # normalize inputs to tuples
+                            def canonize_list(lst):
+                                out = []
+                                for it in lst:
+                                    if isinstance(it, (list, tuple)) and len(it) >= 2:
+                                        out.append(get_canonical_peer_address(it[0], it[1]))
+                                return out
+
+                            known = set(canonize_list(current_peers))
+                            live  = set(canonize_list(list(live_peers)))
+                            seeds = set(canonize_list(HARDCODED_SEEDS))
+
+                            union = known | live | seeds
+                            # drop self
+                            union = {p for p in union if not is_self_peer(p[0])}
+
+                            clean_peers = sanitize_peer_list(list(union))
+
+                            # Save if the *set* actually changed (not just same length)
+                            if set(canonize_list(current_peers)) != set(clean_peers):
+                                save_json(PEERS_FILE, clean_peers)
+                                print(f"🌐 Peer discovery updated: {len(live)} live / {len(clean_peers)} known")
+                            else:
+                                print(f"🌐 Peer discovery: {len(live)} live / {len(clean_peers)} known (no change)")
+
                
        except Exception as e:
            print(f"🔍 Resilient peer discovery error: {e}")
@@ -2393,6 +2808,7 @@ reorg_protection = ReorgProtection()
 attack_prevention = AttackPrevention()
 geographic_tracker = GeographicTracker()
 emergency_system = EmergencyResponseSystem()
+chain_switch_tracker = ChainSwitchTracker(CHAIN_SWITCH_DAMPENING)
 
 # Genesis puzzle is disabled; placeholder for future implementation
 genesis_puzzle = None
@@ -2478,35 +2894,49 @@ def get_puzzle_clue(block_height: int) -> Optional[str]:
     }
     return clues.get(block_height)
 
+
 def is_valid_chain(chain: List[Dict]) -> bool:
-   """Validate entire blockchain"""
+   """Validate entire blockchain after normalization (contiguous prefix)."""
    if not chain:
        return False
-   
+   if not chain:
+        return False
+
+    # CRITICAL: First check indices match positions
+   if not validate_chain_indices_match_positions(chain):
+        return False
+
+    # Then check indices are sequential
+   if not validate_blockchain_indices(chain):
+        return False
+
+   chain = sort_and_dedupe_by_index(chain)
+
    # Validate genesis block
    genesis = chain[0]
-   if genesis['index'] != 0 or genesis['previous_hash'] != '0' * 64:
+   if genesis.get('index') != 0 or genesis.get('previous_hash') != '0' * 64:
        return False
-   
+
    # Validate each subsequent block
    for i in range(1, len(chain)):
        current_block = chain[i]
        previous_block = chain[i - 1]
-       
+
        # Validate block header
        if not CypherMintValidator.validate_block_header(current_block, previous_block):
            return False
-       
+
        # Validate block hash
-       if current_block['hash'] != calculate_block_hash(current_block):
+       if current_block.get('hash') != calculate_block_hash(current_block):
            return False
-       
+
        # Validate merkle root
-       expected_merkle = MerkleTree.calculate_merkle_root(current_block['transactions'])
-       if current_block['merkle_root'] != expected_merkle:
+       expected_merkle = MerkleTree.calculate_merkle_root(current_block.get('transactions', []))
+       if current_block.get('merkle_root') != expected_merkle:
            return False
-   
+
    return True
+
 
 def calculate_chain_work(chain: List[Dict]) -> int:
    """Calculate total work in chain using Bitcoin's method"""
@@ -2832,6 +3262,11 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
                     break
             
             if chain_valid:
+
+                if not validate_blockchain_indices(best_chain):
+                    print("❌ CONSENSUS REJECTED: Chain has invalid block indices")
+                    return local_chain
+                
                 print("✅ CONSENSUS: Chain validation passed - no duplicate transactions")
                 with BLOCKCHAIN_LOCK:
                     save_json(BLOCKCHAIN_FILE, best_chain)
@@ -3049,7 +3484,7 @@ def safe_discover_peers(known_peers: List[Tuple[str, int]]) -> List[Tuple[str, i
 
     # Limit the number of peers we interrogate to prevent spamming the network
     discovery_count = 0
-    max_discoveries = min(len(known_peers), 5)
+    max_discoveries = min(len(known_peers), 10)
 
     # Loop over a copy of the peer set so we can modify all_peers while iterating
     for ip, port in list(all_peers)[:max_discoveries]:
@@ -3194,6 +3629,7 @@ def start_mining(miner_address: str, seed: bool = False):
    
    # Start peer server first
    start_peer_server(blockchain)
+   start_backfill_worker()
    time.sleep(3)  # Give server more time to start properly
 
    external_ip = setup_upnp_port()
@@ -3372,8 +3808,7 @@ def start_mining(miner_address: str, seed: bool = False):
            new_bits = previous_block.get('bits', MAX_TARGET)
        
        # Select transactions from mempool (simplified)
-       selected_transactions = mempool[:10]  # Original code - temporarily bypass validation
-       print(f"📋 Selected {len(selected_transactions)} transactions from mempool for mining")
+       selected_transactions = mempool[:10]  # Limit to 10 transactions
        
        # Create mining cancellation flag
        mining_cancelled = threading.Event()
@@ -3405,39 +3840,46 @@ def start_mining(miner_address: str, seed: bool = False):
            if current_time - last_check >= 0.1:
                with BLOCKCHAIN_LOCK:
                    current_blockchain = load_json(BLOCKCHAIN_FILE, [])
-                   if len(current_blockchain) > len(blockchain):
-                    print(f"🏁 Block {next_block_height} mined by someone else first!")
-                    blockchain = current_blockchain
-                    print(f"✅ Accepted block {next_block_height} from network")
+               if len(current_blockchain) > len(blockchain):
+                if not validate_blockchain_indices(current_blockchain):
+                    print("❌ Rejecting chain with mismatched indices")
+                    continue
                     
-                    # CRITICAL FIX: Remove confirmed transactions from mempool
-                    accepted_block = blockchain[next_block_height]
-                    if accepted_block and 'transactions' in accepted_block:
-                        mempool = load_json(MEMPOOL_FILE, [])
-                        confirmed_tx_ids = set()
-                        
-                        # Get all transaction IDs from the accepted block
-                        for tx in accepted_block['transactions']:
-                            tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
-                            confirmed_tx_ids.add(tx_id)
-                        
-                        # Remove confirmed transactions from mempool
-                        remaining_mempool = []
-                        for mem_tx in mempool:
-                            mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
-                            if mem_tx_id not in confirmed_tx_ids:
-                                remaining_mempool.append(mem_tx)
-                        
-                        save_json(MEMPOOL_FILE, remaining_mempool)
-                        print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
-                       
-                       # Rebuild UTXO if needed
-                        with UTXO_LOCK:
-                           utxos = load_json(UTXO_FILE, [])
-                           expected_blocks = next_block_height + 1
-                           if len(utxos) < expected_blocks:  # Simple heuristic
-                               print("🔄 Rebuilding UTXO set after accepting peer block")
-                               rebuild_utxo_set(blockchain)
+                print(f"🏁 Block {next_block_height} mined by someone else first!")
+                blockchain = current_blockchain
+                print(f"✅ Accepted block {next_block_height} from network")
+                
+                # CRITICAL FIX: Remove confirmed transactions from mempool
+                accepted_block = blockchain[next_block_height]
+                if accepted_block and 'transactions' in accepted_block:
+                    mempool = load_json(MEMPOOL_FILE, [])
+                    confirmed_tx_ids = set()
+                    
+                    # Get all transaction IDs from the accepted block
+                    for tx in accepted_block['transactions']:
+                        tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                        confirmed_tx_ids.add(tx_id)
+                    
+                    # Remove confirmed transactions from mempool
+                    remaining_mempool = []
+                    for mem_tx in mempool:
+                        mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
+                        if mem_tx_id not in confirmed_tx_ids:
+                            remaining_mempool.append(mem_tx)
+                    
+                    save_json(MEMPOOL_FILE, remaining_mempool)
+                    print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
+            
+                # Rebuild UTXO if needed
+                with UTXO_LOCK:
+                    utxos = load_json(UTXO_FILE, [])
+                    expected_blocks = next_block_height + 1
+                    if len(utxos) < expected_blocks:  # Simple heuristic
+                        print("🔄 Rebuilding UTXO set after accepting peer block")
+                        rebuild_utxo_set(blockchain)
+
+                mining_cancelled.set()  # Cancel our mining since someone else won
+                break  # Exit the mining monitoring loop     
                
                last_check = current_time
        
@@ -3506,6 +3948,7 @@ def start_mining(miner_address: str, seed: bool = False):
        elif mining_result['error']:
            print(f"❌ Mining error: {mining_result['error']}")
            time.sleep(1)
+           
        
        # Continue to next block
 
@@ -3578,7 +4021,7 @@ def update_utxo_set(block: Dict):
                 if inp.get('txid') != '0' * 64:
                     utxos = [
                         utxo for utxo in utxos
-                        if not (utxo['txid'] == inp['txid'] and utxo['index'] == inp.get('vout', inp.get('index')))
+                        if not (utxo['txid'] == inp['txid'] and utxo['index'] == inp.get('index', inp.get('vout', 0)))
                     ]
 
             # Add new UTXOs only if not already present
@@ -3644,6 +4087,8 @@ def send_transaction(from_addr: str, to_addr: str, amount: int, wallet_file: str
    if wallet['address'] != from_addr:
        print("Cannot send from an address not owned by this wallet.")
        return
+   
+   
 
    utxos = get_utxos(from_addr)
    print(f"Available UTXOs: {len(utxos)}")
@@ -3664,6 +4109,25 @@ def send_transaction(from_addr: str, to_addr: str, amount: int, wallet_file: str
    if total < amount:
        print(f"Insufficient funds. Need: {amount/100000000:.8f} CPM, Have: {total/100000000:.8f} CPM")
        return
+   
+   # Before creating transaction, check if inputs are recently spent
+   blockchain = load_json(BLOCKCHAIN_FILE, [])
+   recent_blocks = blockchain[-10:] if len(blockchain) >= 10 else blockchain
+
+   recent_spent = set()
+   for block in recent_blocks:
+        for tx in block.get('transactions', []):
+            if tx.get('inputs'):
+                for inp in tx['inputs']:
+                    if inp.get('txid') != '0' * 64:
+                        recent_spent.add(f"{inp['txid']}:{inp.get('index', 0)}")
+
+    # Check selected UTXOs against recent spends
+   for utxo in selected:
+        utxo_key = f"{utxo['txid']}:{utxo['index']}"
+        if utxo_key in recent_spent:
+            print(f"⚠️  WARNING: UTXO {utxo_key} was recently spent! Possible double-spend risk.")
+            return
 
    # Create transaction inputs and outputs with consistent format
    inputs = [{"txid": utxo['txid'], "index": utxo['index']} for utxo in selected]
@@ -3968,12 +4432,47 @@ def start_peer_server(chain_ref: List[Dict]):
    
    threading.Thread(target=run, daemon=True).start()
 
+def process_backfill_once(state_chain_path: str) -> None:
+    try:
+        missing = BACKFILL_QUEUE.pop()
+    except KeyError:
+        return
+    fetched = None
+    for ip, port in HARDCODED_SEEDS:
+        fetched = request_block_by_hash(ip, port, missing)
+        if fetched:
+            break
+    if not fetched:
+        BACKFILL_QUEUE.add(missing)
+        return
+    with BLOCKCHAIN_LOCK:
+        chain = load_json(BLOCKCHAIN_FILE, [])
+    validate_and_add_block(fetched, chain)
+    parent_hash = (fetched.get('hash') or fetched.get('block_hash'))
+    for h, ob in list(ORPHAN_BLOCKS.items()):
+        if ob.get('previous_hash') == parent_hash:
+            ORPHAN_BLOCKS.pop(h, None)
+            with BLOCKCHAIN_LOCK:
+                chain2 = load_json(BLOCKCHAIN_FILE, [])
+            validate_and_add_block(ob, chain2)
+
+def backfill_worker():
+    while True:
+        process_backfill_once(BLOCKCHAIN_FILE)
+        time.sleep(1.0)
+
+def start_backfill_worker():
+    t = threading.Thread(target=backfill_worker, name='backfill', daemon=True)
+    t.start()
+
+
+
 def register_connection(conn, addr):
     """Register a new connection (placeholder)"""
     return f"{addr[0]}:{addr[1]}"
 
 def handle_peer_enhanced(conn, chain: List[Dict], addr):
-    """Enhanced peer handler with witness node support"""
+    """Enhanced peer handler with witness node support and automatic peer sharing"""
    
     ip = addr[0]
     
@@ -3985,6 +4484,34 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
     # Register connection
     conn_id = register_connection(conn, addr)
     
+    # NEW: Automatic peer sharing on connection
+    # NEW: Automatic peer sharing on connection (prefer LIVE peers)
+    if addr[0] not in ['127.0.0.1', '::1', 'localhost']:
+        with PEERS_LOCK:
+            our_peers = load_json(PEERS_FILE, [])
+
+        with LIVE_PEERS_LOCK:
+            live_list = list(LIVE_PEERS_CACHE)
+
+        # prefer live; fall back to known
+        source = live_list if live_list else our_peers
+
+        # Filter out self and the connecting peer
+        peers_to_share = []
+        for p in source:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                ip, prt = get_canonical_peer_address(p[0], p[1])
+                if not is_self_peer(ip) and ip != addr[0]:
+                    peers_to_share.append((ip, prt))
+
+        if peers_to_share:
+            peer_share = {'type': 'peer_announcement', 'data': peers_to_share}
+            try:
+                conn.sendall(json.dumps(peer_share).encode())
+                print(f"📡 Automatically shared {len(peers_to_share)} peers (live-first) with {addr[0]}:{addr[1]}")
+            except:
+                pass
+
     try:
        conn.settimeout(30)
        
@@ -4016,38 +4543,162 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
                bytes_sent += len(chunk)
            
            print(f"✅ Sent {len(response_bytes)} bytes to {addr[0]}:{addr[1]}")
+
+       elif message_type == 'get_headers':
+        # Send just headers
+        start = message.get('data', {}).get('start_height', 0)
+        with BLOCKCHAIN_LOCK:
+            chain = load_json(BLOCKCHAIN_FILE, [])
+            headers = [BlockHeader.extract_header(block) for block in chain[start:]]
+        
+        response = {'type': 'headers_response', 'data': headers}
+        conn.sendall(json.dumps(response).encode())
+    
+       elif message_type == 'get_snapshot':
+            # Send latest UTXO snapshot
+            height = message.get('data', {}).get('height')
+            if os.path.exists(f'snapshot_{height}.json'):
+                snapshot = load_json(f'snapshot_{height}.json')
+                response = {'type': 'snapshot_response', 'data': snapshot}
+                conn.sendall(json.dumps(response).encode())
            
        elif message_type == 'get_peers':
-           with PEERS_LOCK:
-               peers = load_json(PEERS_FILE, [])
-               # Ensure all peers use canonical server ports
-               canonical_peers = [get_canonical_peer_address(peer[0], peer[1]) if isinstance(peer, (list, tuple)) and len(peer) == 2 else peer 
-                                for peer in peers if len(peer) == 2]
-           
-           response = {'type': 'peer_list', 'data': canonical_peers}
-           conn.sendall(json.dumps(response).encode())
-           print(f"📤 Sent peer list ({len(canonical_peers)} peers) to {addr[0]}:{addr[1]}")
-           
-           # Always use server port 8334
-           canonical_peer = (addr[0], PEER_PORT)
-           if canonical_peer not in canonical_peers and addr[0] not in ['127.0.0.1', '::1', 'localhost']:
+    # Load known peers
+        with PEERS_LOCK:
+            known_peers = load_json(PEERS_FILE, [])
+        known_can = []
+        for peer in known_peers:
+            if isinstance(peer, (list, tuple)) and len(peer) == 2:
+                known_can.append(get_canonical_peer_address(peer[0], peer[1]))
+
+        # Add the requesting peer to our known list BEFORE responding
+        req_peer = (addr[0], PEER_PORT)
+        if addr[0] not in ['127.0.0.1', '::1', 'localhost'] and not is_self_peer(addr[0]):
+            if req_peer not in known_can:
+                with PEERS_LOCK:
+                    known_can.append(req_peer)
+                    clean_known = sanitize_peer_list(known_can)
+                    save_json(PEERS_FILE, clean_known)
+                print(f"✅ Added server peer {req_peer[0]}:{req_peer[1]} to peer list")
+
+        # Build the LIVE peer list to broadcast
+        with LIVE_PEERS_LOCK:
+            live_list = list(LIVE_PEERS_CACHE)
+
+        live_can = []
+        for peer in live_list if live_list else known_can:
+            if isinstance(peer, (list, tuple)) and len(peer) == 2:
+                ip, prt = get_canonical_peer_address(peer[0], peer[1])
+                if not is_self_peer(ip):
+                    live_can.append((ip, prt))
+
+        response = {
+            'type': 'peer_list',
+            'data': live_can  # broadcast live peers so clients/explorer reflect reality
+            # NOTE: we could include an extra field if you ever need both:
+            # 'known': clean_known
+        }
+        conn.sendall(json.dumps(response).encode())
+        print(f"📤 Sent LIVE peer list ({len(live_can)} peers) to {addr[0]}:{addr[1]}")
+
+       
+       elif message_type == 'peer_announcement' or message_type == 'peer_exchange':
+           # NEW: Handle incoming peer announcements
+           new_peers = message.get('data', [])
+           if new_peers:
                with PEERS_LOCK:
-                   canonical_peers.append(canonical_peer)
-                   # Sanitize before saving to remove duplicates and self
-                   clean_peers = sanitize_peer_list(canonical_peers)
-                   save_json(PEERS_FILE, clean_peers)
-               print(f"✅ Added server peer {canonical_peer[0]}:{canonical_peer[1]} to peer list")
-               
-       elif message_type == 'new_block':
-           new_block = message.get('data')
-           if new_block:
-               print(f"📥 Received new block {new_block.get('index', '?')} from {addr[0]}:{addr[1]}")
+                   current_peers = load_json(PEERS_FILE, [])
+                   added_count = 0
+                   for peer in new_peers:
+                       if isinstance(peer, (list, tuple)) and len(peer) == 2:
+                           canonical_peer = get_canonical_peer_address(peer[0], peer[1])
+                           if not is_self_peer(canonical_peer[0]) and canonical_peer not in current_peers:
+                               current_peers.append(canonical_peer)
+                               added_count += 1
+                   
+                   if added_count > 0:
+                       clean_peers = sanitize_peer_list(current_peers)
+                       save_json(PEERS_FILE, clean_peers)
+                       print(f"📡 Added {added_count} new peers from {addr[0]}")
+       
+       elif message_type == 'get_block_by_hash':
+           q = message.get('data') or {}
+           want = (q.get('hash') or '').strip()
+           blk = None
+           if want:
                with BLOCKCHAIN_LOCK:
                    current_chain = load_json(BLOCKCHAIN_FILE, [])
-                   if validate_and_add_block(new_block, current_chain):
-                       print(f"✅ Block {new_block['index']} accepted")
-                   else:
-                       print(f"❌ Block {new_block['index']} rejected")
+               for b in current_chain:
+                   if (b.get('hash') or b.get('block_hash')) == want:
+                       blk = b
+                       break
+           response = {'type': 'block_response', 'data': blk}
+           conn.sendall(json.dumps(response).encode())
+
+               
+       elif message_type == 'new_block':
+            new_block = message.get('data')
+            if new_block:
+                print(f"📥 Received new block {new_block.get('index', '?')} from {addr[0]}:{addr[1]}")
+                with BLOCKCHAIN_LOCK:
+                    current_chain = load_json(BLOCKCHAIN_FILE, [])
+                    
+                    # CRITICAL FIX: Check for duplicate transactions in recent blocks
+                    recent_blocks_to_check = 10
+                    existing_tx_ids = set()
+                    
+                    # Get starting point for recent block check
+                    start_index = max(0, len(current_chain) - recent_blocks_to_check)
+                    
+                    # Collect transaction IDs from recent blocks
+                    for i in range(start_index, len(current_chain)):
+                        block = current_chain[i]
+                        for tx in block.get('transactions', []):
+                            # Skip coinbase transactions
+                            if tx.get('type') == 'coinbase':
+                                continue
+                            tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                            existing_tx_ids.add(tx_id)
+                    
+                    # Check new block for duplicates
+                    block_has_duplicates = False
+                    for tx in new_block.get('transactions', []):
+                        # Skip coinbase
+                        if tx.get('type') == 'coinbase':
+                            continue
+                        
+                        tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                        if tx_id in existing_tx_ids:
+                            print(f"❌ Block {new_block['index']} contains duplicate tx from recent blocks: {tx_id[:16]}...")
+                            block_has_duplicates = True
+                            break
+                    
+                    if not block_has_duplicates and validate_and_add_block(new_block, current_chain):
+                        print(f"✅ Block {new_block['index']} accepted")
+                        
+                        # CRITICAL FIX: Remove confirmed transactions from mempool
+                        mempool = load_json(MEMPOOL_FILE, [])
+                        confirmed_tx_ids = set()
+                        
+                        # Get all transaction IDs from the accepted block
+                        for tx in new_block.get('transactions', []):
+                            tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                            confirmed_tx_ids.add(tx_id)
+                        
+                        # Remove confirmed transactions from mempool
+                        remaining_mempool = []
+                        for mem_tx in mempool:
+                            mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
+                            if mem_tx_id not in confirmed_tx_ids:
+                                remaining_mempool.append(mem_tx)
+                        
+                        save_json(MEMPOOL_FILE, remaining_mempool)
+                        print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
+                    else:
+                        if block_has_duplicates:
+                            print(f"❌ Block {new_block['index']} rejected - contains duplicate transactions")
+                        else:
+                            print(f"❌ Block {new_block['index']} rejected - validation failed")
                    
        elif message_type == 'get_info':
            # Send blockchain info including witness status
@@ -4074,7 +4725,7 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
                else:
                    print(f"⚠️  Transaction {tx_id[:16]}... already in mempool")
 
-           elif message_type == 'emergency_alert':
+       elif message_type == 'emergency_alert':
             alert = message.get('data')
             if alert:
                 print(f"🚨 EMERGENCY ALERT from {addr[0]}: {alert['message']}")
@@ -4107,54 +4758,167 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
            pass
 
 def validate_and_add_block(new_block: Dict, blockchain: List[Dict]) -> bool:
-    """Validate and add a new block with attack prevention"""
-    
-    if not blockchain:
-        return False
-    
-    # Get the last block
-    last_block = blockchain[-1]
-    
-    # Validate block header
-    if not CypherMintValidator.validate_block_header(new_block, last_block):
-        return False
-    
-    # Validate all transactions against UTXO set
-    utxos = load_json(UTXO_FILE, [])
-    for i, tx in enumerate(new_block.get('transactions', [])):
-        # Skip coinbase (first transaction)
-        if i == 0 and tx.get('type') == 'coinbase':
-            continue
-            
-        valid, reason = CypherMintValidator.validate_transaction(tx, utxos)
-        if not valid:
-            print(f"❌ Block contains invalid transaction at index {i}: {reason}")
-            return False
-    
-    # Enhanced timestamp validation
-    timestamp_valid, timestamp_reason = attack_prevention.validate_block_timestamp(new_block, blockchain)
-    if not timestamp_valid:
-        print(f"❌ Block rejected: {timestamp_reason}")
-        return False
-    
-    # Validate all transactions
-    for tx in new_block.get('transactions', []):
-        utxos = load_json(UTXO_FILE, [])
-    valid, reason = CypherMintValidator.validate_transaction(tx, utxos)
-    if not valid:
-        print(f"❌ Block contains invalid transaction: {reason}")
-        return False
-    
-    # Check for duplicate transactions within block
-    tx_hashes = [tx.get('txid', '') for tx in new_block.get('transactions', [])]
-    if len(tx_hashes) != len(set(tx_hashes)):
-        print(f"❌ Block contains duplicate transactions")
-        return False
-    
-    # All validations passed
-    return True
+    """Validate and add a new block with normalization and ancestor backfill."""
+    try:
+        with BLOCKCHAIN_LOCK:
+            current_chain = load_json(BLOCKCHAIN_FILE, [])
+            if not current_chain:
+                if new_block.get('index') == 0 and new_block.get('previous_hash') == '0'*64:
+                    if not new_block.get('hash'):
+                        new_block['hash'] = calculate_block_hash(new_block)
+                    save_json(BLOCKCHAIN_FILE, [new_block])
+                    try:
+                        safe_update_utxos(new_block)
+                    except Exception:
+                        pass
+                    return True
+                print("❌ First block must be genesis (index 0)")
+                return False
 
-# Utility functions
+            current_chain = sort_and_dedupe_by_index(current_chain)
+            tip = current_chain[-1]
+
+            # Straight append
+            if (_block_prev_hash_of(new_block) == _block_hash_of(tip) and
+                _block_index_of(new_block) == _block_index_of(tip) + 1):
+                if not CypherMintValidator.validate_block_header(new_block, tip):
+                    return False
+                
+                if new_block['index'] != len(current_chain):
+                    print(f"❌ Block index {new_block['index']} doesn't match expected position {len(current_chain)}")
+                    return False
+
+                # Duplicate & double-spend checks against recent history
+                recent_blocks_to_check = RECENT_DUP_WINDOW
+                existing_tx_ids = set()
+                start_index = max(0, len(current_chain) - recent_blocks_to_check)
+                for i in range(start_index, len(current_chain)):
+                    blk = current_chain[i]
+                    for tx in blk.get('transactions', []):
+                        if tx.get('type') == 'coinbase':
+                            continue
+                        tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                        existing_tx_ids.add(tx_id)
+                recent_spent_inputs = set()
+                for i in range(start_index, len(current_chain)):
+                    blk = current_chain[i]
+                    for tx in blk.get('transactions', []):
+                        for inp in tx.get('inputs', []):
+                            if len(tx.get('inputs', [])) == 1 and inp.get('txid') == '0'*64:
+                                continue
+                            input_key = f"{inp.get('txid')}:{inp.get('index', inp.get('vout', 0))}"
+                            recent_spent_inputs.add(input_key)
+                filtered_txs = []
+                rejected_count = 0
+
+                for tx in new_block.get('transactions', []):
+                    if tx.get('type') == 'coinbase'or (
+                        len(tx.get('inputs', [])) == 1 and tx['inputs'][0].get('txid', '') == '0' * 64
+                    ):
+                        filtered_txs.append(tx)
+                        continue
+
+                    tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+
+                    if tx_id in existing_tx_ids:
+                        print(f"❌ Duplicate transaction detected in new block: {tx_id[:16]}...")
+                        rejected_count +=1
+                        continue
+
+                    is_double_spend = False
+                    for inp in tx.get('inputs', []):
+                        if len(tx.get('inputs', [])) == 1 and inp.get('txid') == '0'*64:
+                            continue
+                        input_key = f"{inp.get('txid')}:{inp.get('index', inp.get('vout', 0))}"
+                        if input_key in recent_spent_inputs:
+                            print(f"🚫 Filtering double-spend input in block {new_block.get('index')}: {input_key}")
+                            rejected_count += 1
+                            is_double_spend = True
+                            break
+                        
+                        if is_double_spend:
+                            continue
+                    
+                if rejected_count > 0:
+                    print(f"🧹 Block {new_block.get('index')} filtered {rejected_count} transaction(s)")
+                    new_block = dict(new_block)  # avoid mutating shared refs
+                    new_block['transactions'] = filtered_txs
+                    # IMPORTANT: recompute Merkle root and hash since the tx set changed
+                    try:
+                        new_block['merkle_root'] = MerkleTree.calculate_merkle_root(new_block['transactions'])
+                    except Exception:
+                        # Fallback if MerkleTree isn't used consistently elsewhere
+                        new_block['merkle_root'] = hashlib.sha256(
+                            json.dumps(new_block['transactions'], sort_keys=True).encode()
+                        ).hexdigest()
+                    new_block['hash'] = calculate_block_hash(new_block)   
+
+                current_chain.append(new_block)
+                save_json(BLOCKCHAIN_FILE, current_chain)
+                try:
+                    safe_update_utxos(new_block)
+                except Exception:
+                    pass
+                return True
+
+            # Same-height competition -> replace tip if higher work and linked
+            if _block_index_of(new_block) == _block_index_of(tip):
+                prev = current_chain[-2] if len(current_chain) >= 2 else None
+                if prev and _block_prev_hash_of(new_block) == _block_hash_of(prev):
+                    new_w = _per_block_work(new_block.get('bits', MAX_TARGET))
+                    old_w = _per_block_work(tip.get('bits', MAX_TARGET))
+                    if new_w > old_w:
+                        current_chain[-1] = new_block
+                        save_json(BLOCKCHAIN_FILE, current_chain)
+                        try:
+                            rebuild_utxo_set(current_chain)
+                        except Exception:
+                            pass
+                        print("🔁 Replaced same-height tip with higher-work block")
+                        return True
+                    else:
+                        print("ℹ️ Keeping current tip (higher/equal work)")
+                        return False
+
+            # Unknown parent -> store as orphan and queue backfill
+            existing_hashes = {(_block_hash_of(b)) for b in current_chain}
+            parent_hash = _block_prev_hash_of(new_block)
+            if parent_hash not in existing_hashes:
+                h = _block_hash_of(new_block)
+                if h:
+                    ORPHAN_BLOCKS[h] = new_block
+                if parent_hash:
+                    BACKFILL_QUEUE.add(parent_hash)
+                print("ℹ️ Queued ancestor for backfill; will retry after fetch")
+                return False
+
+            # Reorg one-deep off ancestor tail if better work
+            index_map = {(_block_hash_of(b)): i for i, b in enumerate(current_chain)}
+            fork_idx = index_map[parent_hash]
+            expected_new_index = _block_index_of(current_chain[fork_idx]) + 1
+            if _block_index_of(new_block) != expected_new_index:
+                print(f"❌ Fork candidate has wrong index at {expected_new_index}")
+                return False
+
+            current_suffix = current_chain[fork_idx+1:]
+            cur_work = sum(_per_block_work(b.get('bits', MAX_TARGET)) for b in current_suffix)
+            new_work = _per_block_work(new_block.get('bits', MAX_TARGET))
+            if new_work <= cur_work:
+                print("ℹ️ New branch does not exceed current work; keeping current")
+                return False
+
+            current_chain = current_chain[:fork_idx+1] + [new_block]
+            save_json(BLOCKCHAIN_FILE, current_chain)
+            try:
+                rebuild_utxo_set(current_chain)
+            except Exception:
+                pass
+            print(f"🔁 Reorged at height {fork_idx}; new branch adopted")
+            return True
+    except Exception as e:
+        print(f"❌ validate_and_add_block error: {e}")
+        return False
+
 def validate_checkpoint(block: Dict) -> bool:
    """Validate block against known checkpoints"""
    if block['index'] in CHECKPOINTS and CHECKPOINTS[block['index']] is not None:
@@ -4296,7 +5060,7 @@ if __name__ == '__main__':
    parser.add_argument('--wallet', default=WALLET_FILE_DEFAULT, help='Wallet file')
    
    # Add send command and update choices
-   command_choices = ['mine', 'wallet', 'balance', 'validate', 'convert', 'send', 'status', 'info']
+   command_choices = ['mine', 'wallet', 'balance', 'validate', 'convert', 'send', 'status', 'info', 'repair']
    if DEVELOPMENT_MODE:
        command_choices.append('cleanup')
    
@@ -4325,7 +5089,12 @@ if __name__ == '__main__':
        save_json(BLOCKCHAIN_FILE, blockchain)
        print(f"Converted genesis_block.json to blockchain.json format")
        print(f"Genesis hash: {genesis_block.get('hash', 'Unknown')}")
-       
+    
+   elif args.command == "repair":
+    cmd_repair_duplicate_heights()
+    sys.exit(0)
+
+
    elif args.command == 'wallet':
        if args.generate:
            wallet = create_wallet(args.wallet)
@@ -4557,4 +5326,47 @@ if __name__ == '__main__':
        
        if is_valid_chain(blockchain) and UTXOValidator.validate_utxo_consistency() and not duplicates_found and checkpoint_valid:
            print("🎉 BLOCKCHAIN FULLY VALIDATED - All checks passed!")
-       
+       else:
+           print("⚠️  Blockchain has issues - see details above")
+
+def cmd_repair_duplicate_heights():
+    """Repair duplicate heights by choosing link-first + look-ahead chain and persist it."""
+    print(f"🔧 Repair using {BLOCKCHAIN_FILE}")
+    chain = load_json(BLOCKCHAIN_FILE, [])
+    if not chain:
+        print("❌ Empty chain"); return
+    by_h: Dict[int, List[Dict]] = {}
+    for b in chain:
+        try:
+            h = int(b.get('index', -1))
+        except Exception:
+            continue
+        by_h.setdefault(h, []).append(b)
+    if not by_h or (0 not in by_h):
+        print("❌ No genesis at height 0"); return
+    def per_work(b):
+        try:
+            return (1 << 256) // (DifficultyAdjustment.bits_to_target(b.get('bits', MAX_TARGET)) + 1)
+        except Exception:
+            return 0
+    g = max(by_h[0], key=per_work)
+    result = [g]
+    expected = 1
+    while expected in by_h:
+        prev = result[-1]
+        prevh = prev.get('hash') or prev.get('block_hash')
+        cands = [c for c in by_h[expected] if (c.get('previous_hash') or c.get('prev_hash')) == prevh]
+        if not cands:
+            break
+        next_h = expected + 1
+        next_parents = set(cb.get('previous_hash') or cb.get('prev_hash') for cb in by_h.get(next_h, []))
+        linked_and_parent = [c for c in cands if (c.get('hash') or c.get('block_hash')) in next_parents]
+        chosen = max(linked_and_parent or cands, key=per_work)
+        result.append(chosen)
+        expected += 1
+    save_json(BLOCKCHAIN_FILE, result)
+    try:
+        rebuild_utxo_set(load_json(BLOCKCHAIN_FILE, []))
+        print(f"✅ Repaired to contiguous height {expected-1} and rebuilt UTXO")
+    except Exception as e:
+        print(f"⚠️ UTXO rebuild warning: {e}")
