@@ -2183,7 +2183,7 @@ def sync_headers_first(peer_ip: str, peer_port: int) -> Optional[List[Dict]]:
             
         # Step 3: Download full blocks in chunks (simple sequential for now)
         blockchain = []
-        chunk_size = 100
+        chunk_size = 250
         
         for i in range(0, len(headers), chunk_size):
             end = min(i + chunk_size, len(headers))
@@ -2356,7 +2356,7 @@ class ConsensusHealing:
             
             # Download in chunks of 100 blocks
             blockchain = []
-            chunk_size = 500 #larger chuncks to reduce overhead
+            chunk_size = 250
             
             for start_height in range(0, chain_height, chunk_size):
                 end_height = min(start_height + chunk_size, chain_height)
@@ -2477,11 +2477,11 @@ def production_consensus_with_healing(peers: List[Tuple[str, int]], is_seed: boo
    
    # Try normal consensus first
    try:
-       consensus_chain = enhanced_consensus_check(peers, is_seed)␊
-       current_chain = load_json(BLOCKCHAIN_FILE, [])␊
-
-       if consensus_chain and calculate_chain_work(consensus_chain) > calculate_chain_work(current_chain):
-           return consensus_chain␊
+       consensus_chain = enhanced_consensus_check(peers, is_seed)
+       current_chain = load_json(BLOCKCHAIN_FILE, [])
+       
+       if consensus_chain and len(consensus_chain) > len(current_chain):
+           return consensus_chain
    except Exception as e:
        print(f"Normal consensus failed: {e}")
    
@@ -3136,11 +3136,10 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
             witness_weight = witness_node.calculate_witness_weight()
             print(f"⭐ Witness node weight: {witness_weight:.2f}")
         
-        peer_chains: List[Tuple[List[Dict], int]] = []
+        peer_chains = []
         better_chains_found = 0
         valid_peer_responses = 0
         witness_peer_count = 0
-        local_work = calculate_chain_work(local_chain)
         
         # Check each peer
         for ip, port in peers[:MAX_CONSENSUS_PEERS]:
@@ -3159,26 +3158,26 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
                     # Receive response
                     response = receive_full_message(sock)
                     
-                    if response and response.get('type') == 'blockchain':␊
-                        peer_chain = response.get('data', [])␊
+                    if response and response.get('type') == 'blockchain':
+                        peer_chain = response.get('data', [])
+                        
+                        if peer_chain and validate_blockchain(peer_chain):
+                            valid_peer_responses += 1
 
-                        if peer_chain and validate_blockchain(peer_chain):␊
-                            valid_peer_responses += 1␊
-␊
-                            if attack_prevention.detect_selfish_mining(peer_chain, ip):␊
-                                print(f"⚠️  Ignoring chain from {ip} due to selfish mining detection")␊
-                                continue␊
-
-                            # Check if peer is a witness node␊
-                            if response.get('witness_node', False):␊
-                                witness_peer_count += 1␊
-
-                            peer_work = calculate_chain_work(peer_chain)
-                            if peer_work > local_work:
-                                better_chains_found += 1␊
-                                print(f"📊 Better chain from {ip}:{port} - Height: {len(peer_chain)} Work: {peer_work}")
-
-                            peer_chains.append((peer_chain, peer_work))
+                            if attack_prevention.detect_selfish_mining(peer_chain, ip):
+                                print(f"⚠️  Ignoring chain from {ip} due to selfish mining detection")
+                                continue
+                            
+                            # Check if peer is a witness node
+                            if response.get('witness_node', False):
+                                witness_peer_count += 1
+                            
+                            # Check if peer has better chain
+                            if len(peer_chain) > len(local_chain):
+                                better_chains_found += 1
+                                print(f"📊 Better chain from {ip}:{port} - Height: {len(peer_chain)}")
+                            
+                            peer_chains.append(peer_chain)
                         else:
                             if peer_chain:
                                 print(f"❌ Invalid chain from {ip}:{port}")
@@ -3197,30 +3196,28 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
         print(f"📊 Consensus results: {valid_peer_responses} valid responses, "
               f"{better_chains_found} better chains, threshold: {effective_threshold}")
         
-       # Find the best chain by total work
-        best_chain = local_chain␊
-        best_work = local_work
-
-        for chain, work in peer_chains:
-            if work > best_work and validate_blockchain(chain):
-                best_chain = chain␊
-                best_work = work
+        # Find the best chain
+        best_chain = local_chain
+        best_height = len(local_chain)
+        
+        for chain in peer_chains:
+            if len(chain) > best_height and validate_blockchain(chain):
+                best_chain = chain
+                best_height = len(chain)
         
         should_adopt = False
         required_improvement = MIN_IMPROVEMENT_NORMAL
         
-         if best_chain != local_chain:
-            # Check if we can switch based on dampening (height-based)
+        if best_chain != local_chain:
+            # Check if we can switch based on dampening
             can_switch, required_improvement = chain_switch_tracker.can_switch(
                 len(local_chain), len(best_chain)
             )
-            if len(best_chain) == len(local_chain) and best_work > local_work:
-                can_switch = True  # Allow switch for equal height but higher work
-
-            if (better_chains_found >= effective_threshold or valid_peer_responses > 0) and best_work > local_work and can_switch:
+            
+            if better_chains_found >= effective_threshold and can_switch:
                 should_adopt = True
-                print(f"🔄 ADOPTING: Higher work chain found (work {best_work} > {local_work})")
-            elif len(best_chain) > len(local_chain) and can_switch:
+                print(f"🔄 ADOPTING: {better_chains_found} better chains found (required improvement: {required_improvement})")
+            elif valid_peer_responses > 0 and len(best_chain) > len(local_chain) and can_switch:
                 should_adopt = True
                 print(f"🔄 ADOPTING: Longer chain found (height {len(best_chain)} > {len(local_chain)}, improvement: {len(best_chain) - len(local_chain)})")
             else:
@@ -3300,20 +3297,83 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
         
         return local_chain
     
-def single_peer_consensus_sync(peer: Tuple[str, int]) -> Optional[List[Dict]]:
+def single_peer_consensus_sync(peer: Tuple[str, int]) -> List[Dict]:
     """Sync with a single authoritative peer"""
     try:
         ip, port = peer
         if is_self_peer(ip):
             print(f"🚫 Skipping self-peer sync: {ip}:{port}")
             return None
+        # Get their blockchain via API (port 5001)
+        if ip == '3.149.130.220':  # Only seed1 has API
+            api_port = 5001
+            try:
+                import requests
+                response = requests.get(f'http://{ip}:{api_port}/api/stats', timeout=30)
+                if response.status_code == 200:
+                    stats = response.json()
+                    target_height = stats.get('height', 0)
 
-        # Use chunked P2P download to minimize connection churn
-        chain = download_blockchain_chunked(ip, port)
-        if chain and is_valid_chain(chain):
-            print(f"✅ Valid chain received from {ip}: {len(chain)} blocks")
-            return chain
-        return None
+                    if target_height > 0:
+                        # Download blockchain block by block
+                        blockchain = []
+                        print(f"📥 Downloading {target_height} blocks from {ip}...")
+
+                        for i in range(target_height):
+                            block_response = requests.get(f'http://{ip}:{api_port}/api/block/{i}', timeout=15)
+                            if block_response.status_code == 200:
+                                blockchain.append(block_response.json())
+                            else:
+                                print(f"Failed to download block {i}")
+                                break
+
+                        if len(blockchain) == target_height and is_valid_chain(blockchain):
+                            print(f"✅ Successfully downloaded {len(blockchain)} blocks from {ip}")
+                            return blockchain
+            except Exception as e:
+                print(f"API sync failed for {ip}: {e}")
+
+        # Fallback to P2P sync
+        sock = create_safe_connection(ip, 8334, timeout=30)  # P2P port
+        if not sock:
+            return None
+
+        try:
+            request = {'type': 'get_chain'}
+            sock.sendall(json.dumps(request).encode())
+
+            chunks = []
+            sock.settimeout(60)
+
+            while True:
+                try:
+                    chunk = sock.recv(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                except socket.timeout:
+                    break
+
+            if chunks:
+                data = b''.join(chunks)
+                message = json.loads(data.decode())
+
+                if message.get('type') == 'full_chain':
+                    peer_chain = message.get('data', [])
+
+                    if is_valid_chain(peer_chain):
+                        print(f"✅ Valid chain received from {ip}: {len(peer_chain)} blocks")
+                        return peer_chain
+
+            return None
+        except Exception as e:
+            print(f"Single-peer sync error: {e}")
+            return None
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
     except Exception as e:
         print(f"Single-peer sync error: {e}")
         return None
@@ -3334,23 +3394,21 @@ def enhanced_consensus_recovery(peers: List, is_seed: bool = False, max_failures
            print(f"🔄 Consensus attempt {attempt + 1}/{max_failures}")
            consensus_chain = production_consensus_with_healing(peers, is_seed)
            current_chain = load_json(BLOCKCHAIN_FILE, [])
-
+           
            # Safe None check
            if consensus_chain is None:
                print(f"⚠️ Consensus attempt {attempt + 1} returned None - no valid responses")
                continue
-
+               
            if not isinstance(consensus_chain, list):
                print(f"⚠️ Consensus attempt {attempt + 1} returned invalid type: {type(consensus_chain)}")
                continue
-
-           current_work = calculate_chain_work(current_chain)
-           chain_work = calculate_chain_work(consensus_chain)
-           if chain_work > current_work:
-               print(f"✅ Multi-peer consensus successful: {len(consensus_chain)} blocks (work {chain_work})")
+           
+           if len(consensus_chain) > len(current_chain):
+               print(f"✅ Multi-peer consensus successful: {len(consensus_chain)} blocks")
                return consensus_chain
            else:
-               print(f"📊 Consensus chain not better: work {chain_work} <= current {current_work}")
+               print(f"📊 Consensus chain not longer: {len(consensus_chain)} vs current {len(current_chain)}")
                
        except Exception as e:
            print(f"⚠️ Consensus attempt {attempt + 1} failed: {e}")
@@ -3392,10 +3450,10 @@ def enhanced_consensus_recovery(peers: List, is_seed: bool = False, max_failures
                    print(f"⚠️ Single-peer sync from {peer[0]} returned invalid type: {type(single_peer_chain)}")
                    continue
                
-               if single_peer_chain:
-                   current_chain = load_json(BLOCKCHAIN_FILE, [])␊
-                   if calculate_chain_work(single_peer_chain) > calculate_chain_work(current_chain):
-                       print(f"✅ Successfully synced from {peer[0]} - height {len(single_peer_chain)}")␊
+               if len(single_peer_chain) > 0:
+                   current_chain = load_json(BLOCKCHAIN_FILE, [])
+                   if len(single_peer_chain) > len(current_chain):
+                       print(f"✅ Successfully synced from {peer[0]} - height {len(single_peer_chain)}")
                        return single_peer_chain
                    
            except Exception as e:
@@ -3478,22 +3536,21 @@ def force_initial_consensus(peers: List[Tuple[str, int]], is_seed: bool = False)
    print(f"🔄 FORCE INITIAL CONSENSUS - attempting {INITIAL_SYNC_ATTEMPTS} sync attempts...")
    
    best_chain = []
-   best_work = 0
    
    for attempt in range(INITIAL_SYNC_ATTEMPTS):
        print(f"🔄 Consensus attempt {attempt + 1}/{INITIAL_SYNC_ATTEMPTS}")
        
-       consensus_chain = enhanced_consensus_recovery(peers, is_seed=is_seed)
-
-           chain_work = calculate_chain_work(consensus_chain)
-           if chain_work > best_work:
+       try:
+           consensus_chain = enhanced_consensus_recovery(peers, is_seed=is_seed)
+           
+           if len(consensus_chain) > len(best_chain):
                best_chain = consensus_chain
-               best_work = chain_work
-               print(f"✅ Improved consensus: height {len(best_chain)} work {best_work}")
+               print(f"✅ Improved consensus: height {len(best_chain)}")
            
            # If we got a reasonable chain, we can proceed
-           if len(best_chain) > 0:␊
-               print(f"✅ Initial consensus successful: height {len(best_chain)} work {best_work}")
+           if len(best_chain) > 0:
+               print(f"✅ Initial consensus successful: height {len(best_chain)}")
+               return best_chain
                
        except Exception as e:
            print(f"⚠️  Consensus attempt {attempt + 1} failed: {e}")
@@ -3501,8 +3558,8 @@ def force_initial_consensus(peers: List[Tuple[str, int]], is_seed: bool = False)
        if attempt < INITIAL_SYNC_ATTEMPTS - 1:
            time.sleep(2)  # Wait between attempts
    
-   print(f"⚠️  Initial consensus completed with height {len(best_chain)} work {best_work}")
-   return best_chain␊
+   print(f"⚠️  Initial consensus completed with height {len(best_chain)}")
+   return best_chain
 
 def start_mining(miner_address: str, seed: bool = False):
    """Start mining process with enhanced consensus and witness node tracking"""
@@ -3567,8 +3624,7 @@ def start_mining(miner_address: str, seed: bool = False):
    print(f"Witness status: {'ACTIVE' if witness_node.witness_status else 'BUILDING REPUTATION'}")
    
    with PEERS_LOCK:
-       current_peers = sanitize_peer_list(load_json(PEERS_FILE, []))
-       save_json(PEERS_FILE, current_peers)
+       current_peers = load_json(PEERS_FILE, [])
        print(f"Known peers: {len(current_peers)}")
    
    # Start peer server first
@@ -3576,16 +3632,11 @@ def start_mining(miner_address: str, seed: bool = False):
    start_backfill_worker()
    time.sleep(3)  # Give server more time to start properly
 
-    external_ip = setup_upnp_port()
+   external_ip = setup_upnp_port()
    if external_ip:
        print(f"🎉 Network-accessible at {external_ip}:{PEER_PORT}")
    else:
        print(f"⚠️  May not be reachable from internet - check router settings")
-
-   # Now that external IP is known, purge any self references from peer list
-   with PEERS_LOCK:
-       clean_peers = sanitize_peer_list(load_json(PEERS_FILE, []))
-       save_json(PEERS_FILE, clean_peers)
    
    # Start resilient peer discovery background process
    threading.Thread(target=resilient_peer_discovery, daemon=True).start()
@@ -3596,8 +3647,8 @@ def start_mining(miner_address: str, seed: bool = False):
    print("🧹 Connection pool monitoring enabled")
    
    # CONSENSUS FIX: MANDATORY initial consensus for ALL nodes
-   with PEERS_LOCK:␊
-       peers = sanitize_peer_list(load_json(PEERS_FILE, []))
+   with PEERS_LOCK:
+       peers = load_json(PEERS_FILE, [])
    
    if peers:
        print("🔄 CONSENSUS FIX: Mandatory initial consensus sync...")
@@ -3709,11 +3760,11 @@ def start_mining(miner_address: str, seed: bool = False):
        if peers:
            try:
                print(f"🔄 PRE-MINING CONSENSUS CHECK...")
-               consensus_blockchain = enhanced_consensus_recovery(peers, is_seed=seed)␊
-               with BLOCKCHAIN_LOCK:␊
-                   current_blockchain = load_json(BLOCKCHAIN_FILE, [])␊
-                   if calculate_chain_work(consensus_blockchain) > calculate_chain_work(current_blockchain):
-                       blockchain = consensus_blockchain␊
+               consensus_blockchain = enhanced_consensus_recovery(peers, is_seed=seed)
+               with BLOCKCHAIN_LOCK:
+                   current_blockchain = load_json(BLOCKCHAIN_FILE, [])
+                   if len(consensus_blockchain) > len(current_blockchain):
+                       blockchain = consensus_blockchain
                        save_json(BLOCKCHAIN_FILE, blockchain)
                        # Rebuild UTXO set from consensus chain
                        print("🔄 Pre-mining: Rebuilding UTXO set after consensus update...")
@@ -3787,50 +3838,50 @@ def start_mining(miner_address: str, seed: bool = False):
            
            # Check blockchain every 100ms
            if current_time - last_check >= 0.1:
-               with BLOCKCHAIN_LOCK:␊
-                   current_blockchain = load_json(BLOCKCHAIN_FILE, [])␊
-               if calculate_chain_work(current_blockchain) > calculate_chain_work(blockchain):
-                   if not validate_blockchain_indices(current_blockchain):
-                       print("❌ Rejecting chain with mismatched indices")
-                       continue
-
-                   print(f"🏁 Block {next_block_height} mined by someone else first!")
-                   blockchain = current_blockchain
-                   print(f"✅ Accepted block {next_block_height} from network")
-
-                   # CRITICAL FIX: Remove confirmed transactions from mempool
-                   accepted_block = blockchain[next_block_height]
-                   if accepted_block and 'transactions' in accepted_block:
-                       mempool = load_json(MEMPOOL_FILE, [])
-                       confirmed_tx_ids = set()
-
-                       # Get all transaction IDs from the accepted block
-                       for tx in accepted_block['transactions']:
-                           tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
-                           confirmed_tx_ids.add(tx_id)
-
-                       # Remove confirmed transactions from mempool
-                       remaining_mempool = []
-                       for mem_tx in mempool:
-                           mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
-                           if mem_tx_id not in confirmed_tx_ids:
-                               remaining_mempool.append(mem_tx)
-
-                       save_json(MEMPOOL_FILE, remaining_mempool)
-                       print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
+               with BLOCKCHAIN_LOCK:
+                   current_blockchain = load_json(BLOCKCHAIN_FILE, [])
+               if len(current_blockchain) > len(blockchain):
+                if not validate_blockchain_indices(current_blockchain):
+                    print("❌ Rejecting chain with mismatched indices")
+                    continue
+                    
+                print(f"🏁 Block {next_block_height} mined by someone else first!")
+                blockchain = current_blockchain
+                print(f"✅ Accepted block {next_block_height} from network")
+                
+                # CRITICAL FIX: Remove confirmed transactions from mempool
+                accepted_block = blockchain[next_block_height]
+                if accepted_block and 'transactions' in accepted_block:
+                    mempool = load_json(MEMPOOL_FILE, [])
+                    confirmed_tx_ids = set()
+                    
+                    # Get all transaction IDs from the accepted block
+                    for tx in accepted_block['transactions']:
+                        tx_id = tx.get('txid') or double_sha256(json.dumps(tx, sort_keys=True))
+                        confirmed_tx_ids.add(tx_id)
+                    
+                    # Remove confirmed transactions from mempool
+                    remaining_mempool = []
+                    for mem_tx in mempool:
+                        mem_tx_id = mem_tx.get('txid') or double_sha256(json.dumps(mem_tx, sort_keys=True))
+                        if mem_tx_id not in confirmed_tx_ids:
+                            remaining_mempool.append(mem_tx)
+                    
+                    save_json(MEMPOOL_FILE, remaining_mempool)
+                    print(f"🧹 Removed {len(mempool) - len(remaining_mempool)} confirmed transactions from mempool")
             
                 # Rebuild UTXO if needed
-                   with UTXO_LOCK:
-                       utxos = load_json(UTXO_FILE, [])
-                       expected_blocks = next_block_height + 1
-                       if len(utxos) < expected_blocks:  # Simple heuristic
-                           print("🔄 Rebuilding UTXO set after accepting peer block")
-                           rebuild_utxo_set(blockchain)
-␊
-                   mining_cancelled.set()  # Cancel our mining since someone else won
-                   break  # Exit the mining monitoring loop
+                with UTXO_LOCK:
+                    utxos = load_json(UTXO_FILE, [])
+                    expected_blocks = next_block_height + 1
+                    if len(utxos) < expected_blocks:  # Simple heuristic
+                        print("🔄 Rebuilding UTXO set after accepting peer block")
+                        rebuild_utxo_set(blockchain)
 
-               last_check = current_time␊
+                mining_cancelled.set()  # Cancel our mining since someone else won
+                break  # Exit the mining monitoring loop     
+               
+               last_check = current_time
        
        # Wait for mining thread to finish
        mining_thread.join(timeout=3)
@@ -5319,4 +5370,3 @@ def cmd_repair_duplicate_heights():
         print(f"✅ Repaired to contiguous height {expected-1} and rebuilt UTXO")
     except Exception as e:
         print(f"⚠️ UTXO rebuild warning: {e}")
-
