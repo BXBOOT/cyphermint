@@ -14,6 +14,7 @@ import requests
 from decimal import Decimal, getcontext
 from typing import List, Dict, Optional, Tuple
 import math
+import random
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -44,6 +45,22 @@ ORPHAN_BLOCKS: Dict[str, Dict] = {}
 BACKFILL_QUEUE: set = set()
 LIVE_PEERS_CACHE = set()
 LIVE_PEERS_LOCK = threading.Lock()
+
+# How many peers to ping per discovery tick (keep small on tiny nets)
+DISCOVERY_FANOUT = int(os.environ.get("CYM_DISCOVERY_FANOUT", "2"))
+# Don’t ask the same peer for peers again before this many seconds
+GETPEERS_TTL     = int(os.environ.get("CYM_GETPEERS_TTL", "300"))  # 5 min
+# Backoff (seconds) when a connect or recv fails; doubles up to MAX
+DEFAULT_BACKOFF  = 60
+MAX_BACKOFF      = 900
+
+# Per-peer state
+LAST_GETPEERS = {}   # (ip,port) -> last_ts
+PEER_BACKOFF  = {}   # (ip,port) -> retry_after_ts
+
+CHAIN_SEGMENT_MAX     = 200          # must be <= server cap
+SINGLE_SYNC_TTL       = 120          # don't re-sync same peer within 2 min
+_single_sync_backoff  = {}           # (ip,port) -> retry_after_ts
 
 def request_block_by_hash(ip: str, port: int, block_hash: str) -> Optional[Dict]:
     """Ask a peer for a block by its hash. Returns a block dict or None."""
@@ -104,6 +121,122 @@ def cmd_repair_duplicate_heights() -> None:
     tip = fixed[-1]
     print(f"✅ Repaired chain to contiguous height {tip.get('index')} ({after}/{before} kept)")
     print("🔧 UTXO set rebuilt")
+
+def try_adopt_chain(candidate_chain: List[Dict]) -> bool:
+    """
+    Adopt candidate_chain iff it is valid and strictly better by total work
+    (height breaks ties). Atomically replaces BLOCKCHAIN_FILE, then rebuilds
+    UTXOs (if a rebuild helper exists) and prunes confirmed txs from mempool.
+    Returns True if adoption happened.
+    """
+    # 0) Sanity
+    if not candidate_chain or not is_valid_chain(candidate_chain):
+        return False
+
+    # Candidate tip info
+    cand_h = candidate_chain[-1].get("index", len(candidate_chain) - 1)
+    cand_w = calculate_chain_work(candidate_chain)
+
+    # 1) Compare against local tip under lock
+    with BLOCKCHAIN_LOCK:
+        local_chain = load_json(BLOCKCHAIN_FILE, [])
+        if local_chain:
+            local_h = local_chain[-1].get("index", len(local_chain) - 1)
+            local_w = calculate_chain_work(local_chain)
+        else:
+            local_h, local_w = -1, 0
+
+        # Must be strictly better by work (height breaks ties)
+        if not (cand_w > local_w or (cand_w == local_w and cand_h > local_h)):
+            return False
+
+        # 2) Atomic write of new chain
+        tmp = BLOCKCHAIN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(candidate_chain, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, BLOCKCHAIN_FILE)
+
+        # 3) Optional: rebuild UTXOs if your project exposes a helper
+        rebuild_fn = (globals().get("rebuild_utxo_set_from_chain")
+                      or globals().get("rebuild_utxos")
+                      or globals().get("reindex_utxos_from_chain"))
+        if callable(rebuild_fn):
+            try:
+                rebuild_fn(candidate_chain)
+            except Exception as e:
+                print(f"⚠️ UTXO rebuild failed after adoption: {e}")
+
+        # 4) Best-effort: prune confirmed txs from mempool
+        try:
+            mem = load_json(MEMPOOL_FILE, [])
+            confirmed = {
+                tx.get("txid")
+                for b in candidate_chain
+                for tx in b.get("transactions", [])
+                if tx.get("txid")
+            }
+            mem = [tx for tx in mem if tx.get("txid") not in confirmed]
+            save_json(MEMPOOL_FILE, mem)
+        except Exception:
+            pass
+
+    print(f"✅ Chain adopted: height {cand_h}, work {cand_w}")
+    return True
+
+def _local_tip_info() -> Tuple[int, int]:
+    """
+    Return (local_height, local_total_work) from the current on-disk chain.
+    Height is the last block's index (or len(chain)-1 as fallback).
+    """
+    with BLOCKCHAIN_LOCK:
+        chain = load_json(BLOCKCHAIN_FILE, [])
+    if not chain:
+        return (-1, 0)
+    h = chain[-1].get('index', len(chain) - 1)
+    w = calculate_chain_work(chain)
+    return (int(h), int(w))
+
+
+def get_peer_info_quick(ip: str, port: int, timeout: int = 5) -> Optional[dict]:
+    """
+    Lightweight pre-check: ask a peer for height/total_work before any heavy sync.
+    Returns: {'ip','port','height','total_work','latest_hash'} or None.
+    """
+    if is_self_peer(ip):
+        return None
+
+    s = create_safe_connection(ip, port, timeout=timeout)
+    if not s:
+        return None
+
+    try:
+        s.settimeout(timeout)
+        # If your server expects newline-delimited JSON, add + b"\\n"
+        s.sendall(json.dumps({'type': 'get_info'}).encode())
+        data = s.recv(BUFFER_SIZE)
+        if not data:
+            return None
+
+        msg = json.loads(data.decode())
+        if msg.get('type') != 'info_response':
+            return None
+
+        d = msg.get('data', {}) or {}
+        return {
+            'ip': ip,
+            'port': port,
+            'height': int(d.get('height', -1)),
+            'total_work': int(d.get('total_work', 0)),
+            'latest_hash': d.get('latest_hash'),
+        }
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except:
+            pass
 
 
 def _block_hash_of(b: Dict) -> str:
@@ -429,11 +562,11 @@ WITNESS_LOCK = threading.RLock()
 ORPHAN_BLOCKS = ORPHAN_BLOCKS if 'ORPHAN_BLOCKS' in globals() else {}
 BACKFILL_QUEUE = BACKFILL_QUEUE if 'BACKFILL_QUEUE' in globals() else set()
 
-
-
 # Connection pool management
 ACTIVE_CONNECTIONS = {}
 CONNECTION_POOL_LOCK = threading.Lock()
+CONNECTION_CACHE = {}
+CONNECTION_CACHE_LOCK = threading.Lock()
 
 # Checkpoint system for critical blocks
 CHECKPOINTS = {
@@ -457,6 +590,26 @@ WITNESS_MAX_WEIGHT = 3.0
 # Fork memory parameters
 FORK_PENALTY_DURATION = 3600  # 1 hour penalty for frequent forking chains
 MIN_CHAIN_IMPROVEMENT = 3     # Require 3+ blocks improvement to switch chains
+
+def get_cached_connection(ip: str, port: int) -> Optional[socket.socket]:
+    """Get or create a cached connection"""
+    key = f"{ip}:{port}"
+    
+    with CONNECTION_CACHE_LOCK:
+        if key in CONNECTION_CACHE:
+            sock = CONNECTION_CACHE[key]
+            # Test if still alive
+            try:
+                sock.send(b'')
+                return sock
+            except:
+                del CONNECTION_CACHE[key]
+        
+        # Create new connection
+        sock = create_safe_connection(ip, port)
+        if sock:
+            CONNECTION_CACHE[key] = sock
+        return sock
 
 def load_json(filename, default=None):
     import os
@@ -2329,89 +2482,64 @@ class ConsensusHealing:
     
     @staticmethod
     def download_peer_chain(ip: str, port: int) -> Optional[List[Dict]]:
-        """Download blockchain in chunks to handle large chains"""
+        """Download blockchain with proper connection handling"""
         try:
-            sock = create_safe_connection(ip, port, timeout=30)
+            sock = create_safe_connection(ip, port, timeout=300)  # Long timeout
             if not sock:
                 return None
             
-            # First, get the chain height
-            request = {'type': 'get_info'}
+            request = {'type': 'get_chain'}
             sock.sendall(json.dumps(request).encode())
-            sock.settimeout(10)
             
-            data = sock.recv(BUFFER_SIZE)
-            if not data:
+            # Read size first
+            size_data = sock.recv(4)
+            if not size_data or len(size_data) < 4:
+                print(f"❌ No size header from {ip}:{port}")
                 return None
                 
-            info = json.loads(data.decode())
-            if info.get('type') != 'info_response':
-                return None
-                
-            chain_height = info.get('data', {}).get('height', 0)
-            if chain_height == 0:
-                return None
-                
-            print(f"📊 Peer {ip} has chain height: {chain_height}")
+            expected_size = struct.unpack('!I', size_data)[0]
+            print(f"📊 Expecting {expected_size} bytes from {ip}:{port}")
             
-            # Download in chunks of 100 blocks
-            blockchain = []
-            chunk_size = 250
+            # Read exact amount
+            chunks = []
+            received = 0
             
-            for start_height in range(0, chain_height, chunk_size):
-                end_height = min(start_height + chunk_size, chain_height)
+            while received < expected_size:
+                chunk_size = min(65536, expected_size - received)
+                chunk = sock.recv(chunk_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
                 
-                # Request specific block range
-                chunk_request = {
-                    'type': 'get_blocks_range',
-                    'data': {
-                        'start': start_height,
-                        'end': end_height
-                    }
-                }
-                
-                sock.sendall(json.dumps(chunk_request).encode())
-                
-                chunks = []
-                sock.settimeout(30)
-                
-                while True:
-                    try:
-                        chunk = sock.recv(BUFFER_SIZE)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                    except socket.timeout:
-                        break
-                
-                if chunks:
-                    chunk_data = b''.join(chunks)
-                    try:
-                        response = json.loads(chunk_data.decode())
-                        if response.get('type') == 'blocks_range':
-                            blocks = response.get('data', [])
-                            blockchain.extend(blocks)
-                            print(f"📦 Downloaded blocks {start_height}-{end_height} ({len(blocks)} blocks)")
-                    except json.JSONDecodeError:
-                        print(f"❌ Failed to parse chunk {start_height}-{end_height}")
-                        return None
-                
-                # Small delay between chunks
-                time.sleep(0.1)
+                if received % (1024 * 1024) == 0:  # Progress every MB
+                    print(f"📥 Downloaded {received}/{expected_size} bytes...")
             
-            sock.close()
-            
-            if len(blockchain) == chain_height and is_valid_chain(blockchain):
-                print(f"✅ Successfully downloaded {len(blockchain)} blocks from {ip}")
-                return blockchain
+            if received == expected_size:
+                # Send ACK
+                sock.sendall(b'ACK')
+                
+                data = b''.join(chunks)
+                message = json.loads(data.decode())
+                
+                if message.get('type') == 'full_chain':
+                    peer_chain = message.get('data', [])
+                    print(f"✅ Successfully downloaded {len(peer_chain)} blocks from {ip}")
+                    return peer_chain
             else:
-                print(f"❌ Downloaded chain incomplete or invalid")
-                return None
+                print(f"❌ Size mismatch: got {received}, expected {expected_size}")
                 
+            return None
+            
         except Exception as e:
             print(f"Error downloading chain from {ip}:{port}: {e}")
             return None
-    
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+        
 # Integration Functions
 def enhanced_validate_and_add_block(new_block: Dict, current_chain: List[Dict]) -> bool:
     """Enhanced block validation using production validator with witness weights"""
@@ -2668,111 +2796,116 @@ def discover_bootstrap_peers() -> List[Tuple[str, int]]:
     return final_peer_list
 
 def resilient_peer_discovery():
-   """Production-grade peer discovery that survives seed node failures"""
-   while True:
-       time.sleep(BASE_PEER_BROADCAST_INTERVAL)
-       try:
-           with PEERS_LOCK:
-               current_peers = load_json(PEERS_FILE, [])
-               # Filter out our own address from the peer list to avoid self-connections
-               current_peers = [peer for peer in current_peers if not (isinstance(peer, (list, tuple)) and len(peer) >= 2 and is_self_peer(peer[0]))]
-               
-               # Phase 1: Try bootstrap discovery if peer list is empty or mostly dead
-               if len(current_peers) < 2:
-                   print("🔄 Peer list depleted, attempting bootstrap discovery...")
-                   bootstrap_peers = discover_bootstrap_peers()
-                   if bootstrap_peers:
-                       current_peers = bootstrap_peers
-                       # Sanitize before saving
-                       clean_peers = sanitize_peer_list(current_peers)
-                       save_json(PEERS_FILE, clean_peers)
-                       print(f"✅ Bootstrap recovery: Found {len(clean_peers)} peers")
-               
-               # Phase 2: Cross-discovery from existing peers
-               if current_peers:
-                   live_peers = set()
-                   
-                   # Test each known peer and get their peer lists
-                   for ip, port in current_peers[:8]:
-                       canonical_peer = get_canonical_peer_address(ip, port)
-                       # Skip self connections
-                       if is_self_peer(canonical_peer[0]):
-                           continue
-                       sock = create_safe_connection(canonical_peer[0], canonical_peer[1], timeout=15)
-                       if sock:
-                           try:
-                               # This peer is alive
-                               live_peers.add(canonical_peer)
-                               # Get their peer list
-                               request = {'type': 'get_peers'}
-                               sock.sendall(json.dumps(request).encode())
-                               sock.settimeout(10)
-                               data = sock.recv(BUFFER_SIZE)
-                               if data:
-                                   message = json.loads(data.decode())
-                                   if message.get('type') == 'peer_list':
-                                       peer_list = message.get('data', [])
-                                       for peer_ip, peer_port in peer_list:
-                                           canonical = get_canonical_peer_address(peer_ip, peer_port)
-                                           # Skip self to avoid loops
-                                           if is_self_peer(canonical[0]):
-                                               continue
-                                           live_peers.add(canonical)
-                                       print(f"🔍 Cross-discovery: Got {len(peer_list)} peers from {ip}:{port}")
-                           except Exception as e:
-                               print(f"🔍 Cross-discovery failed for {ip}:{port}: {e}")
-                           finally:
-                               close_safe_connection(sock, canonical_peer[0], canonical_peer[1])
-                   
-                   # Update peer list with live peers
-                   # ---- replace your "Update peer list with live peers" block ----
-                    # Keep a union of known + live + hardcoded seeds, but only broadcast live
-                   if live_peers:
-                        # Update live peer cache for broadcasting and API use
-                        global LIVE_PEERS_CACHE
-                        with LIVE_PEERS_LOCK:
-                            # avoid rebinding to keep thread-safety simple
-                            try:
-                                LIVE_PEERS_CACHE.clear()
-                            except NameError:
-                                pass
-                            try:
-                                LIVE_PEERS_CACHE.update(live_peers)
-                            except NameError:
-                                # define on first run
-                                LIVE_PEERS_CACHE = set(live_peers)
+    """Production-grade peer discovery that survives seed node failures (randomized + throttled)"""
+    while True:
+        time.sleep(BASE_PEER_BROADCAST_INTERVAL)
+        try:
+            # Load and drop self up-front
+            with PEERS_LOCK:
+                current_peers = load_json(PEERS_FILE, [])
+                current_peers = [
+                    p for p in current_peers
+                    if isinstance(p, (list, tuple)) and len(p) >= 2 and not is_self_peer(p[0])
+                ]
 
-                        # Persist the union so we don't forget offline peers
-                        with PEERS_LOCK:
-                            current_peers = load_json(PEERS_FILE, [])
-                            # normalize inputs to tuples
-                            def canonize_list(lst):
-                                out = []
-                                for it in lst:
-                                    if isinstance(it, (list, tuple)) and len(it) >= 2:
-                                        out.append(get_canonical_peer_address(it[0], it[1]))
-                                return out
+            # Phase 1: bootstrap if depleted
+            if len(current_peers) < 2:
+                print("🔄 Peer list depleted, attempting bootstrap discovery...")
+                bootstrap_peers = discover_bootstrap_peers()
+                if bootstrap_peers:
+                    clean_peers = sanitize_peer_list(bootstrap_peers)
+                    with PEERS_LOCK:
+                        save_json(PEERS_FILE, clean_peers)
+                    current_peers = clean_peers
+                    print(f"✅ Bootstrap recovery: Found {len(clean_peers)} peers")
 
-                            known = set(canonize_list(current_peers))
-                            live  = set(canonize_list(list(live_peers)))
-                            seeds = set(canonize_list(HARDCODED_SEEDS))
+            # Phase 2: cross-discovery from existing peers (randomized & rate-limited)
+            if current_peers:
+                # Canonicalize and filter self once
+                candidates = []
+                for ip, port in current_peers:
+                    cip, cport = get_canonical_peer_address(ip, port)
+                    if not is_self_peer(cip):
+                        candidates.append((cip, cport))
 
-                            union = known | live | seeds
-                            # drop self
-                            union = {p for p in union if not is_self_peer(p[0])}
+                # Randomize which peers we try this round
+                random.shuffle(candidates)
 
-                            clean_peers = sanitize_peer_list(list(union))
+                live_peers = set()
+                pinged = 0
+                now = time.time()
 
-                            # Save if the *set* actually changed (not just same length)
-                            if set(canonize_list(current_peers)) != set(clean_peers):
-                                save_json(PEERS_FILE, clean_peers)
-                                print(f"🌐 Peer discovery updated: {len(live)} live / {len(clean_peers)} known")
-                            else:
-                                print(f"🌐 Peer discovery: {len(live)} live / {len(clean_peers)} known (no change)")
+                for ip, port in candidates:
+                    if pinged >= DISCOVERY_FANOUT:
+                        break
 
-               
-       except Exception as e:
-           print(f"🔍 Resilient peer discovery error: {e}")
+                    # Respect per-peer backoff and TTL
+                    if now < PEER_BACKOFF.get((ip, port), 0):
+                        continue
+                    if now - LAST_GETPEERS.get((ip, port), 0) < GETPEERS_TTL:
+                        continue
+
+                    sock = create_safe_connection(ip, port, timeout=15)
+                    if not sock:
+                        # schedule backoff
+                        next_wait = min(MAX_BACKOFF, (PEER_BACKOFF.get((ip, port), 0) - now) * 2 if (ip, port) in PEER_BACKOFF else DEFAULT_BACKOFF)
+                        PEER_BACKOFF[(ip, port)] = now + max(DEFAULT_BACKOFF, next_wait)
+                        continue
+
+                    try:
+                        live_peers.add((ip, port))
+                        # Ask for peers once, then cool down this peer
+                        sock.settimeout(10)
+                        sock.sendall(json.dumps({'type': 'get_peers'}).encode())
+                        data = sock.recv(BUFFER_SIZE)
+                        LAST_GETPEERS[(ip, port)] = now
+                        if data:
+                            message = json.loads(data.decode())
+                            if message.get('type') == 'peer_list':
+                                peer_list = message.get('data', [])
+                                added = 0
+                                for peer_ip, peer_port in peer_list:
+                                    pi, pp = get_canonical_peer_address(peer_ip, peer_port)
+                                    if not is_self_peer(pi):
+                                        live_peers.add((pi, pp))
+                                        added += 1
+                                print(f"🔍 Cross-discovery: got {len(peer_list)} (added {added}) from {ip}:{port}")
+                        pinged += 1
+                    except Exception as e:
+                        # exponential-ish backoff with a cap
+                        prev = PEER_BACKOFF.get((ip, port), 0)
+                        wait = min(MAX_BACKOFF, DEFAULT_BACKOFF if prev <= now else (prev - now) * 2)
+                        PEER_BACKOFF[(ip, port)] = now + wait
+                        print(f"🔍 Cross-discovery failed for {ip}:{port}: {e} (backoff ~{int(wait)}s)")
+                    finally:
+                        close_safe_connection(sock, ip, port)
+
+                # Persist union of known + live + seeds; never include self
+                if live_peers:
+                    with PEERS_LOCK:
+                        current = load_json(PEERS_FILE, [])
+                        def canonize(lst):
+                            out = []
+                            for it in lst:
+                                if isinstance(it, (list, tuple)) and len(it) >= 2:
+                                    out.append(get_canonical_peer_address(it[0], it[1]))
+                            return out
+
+                        known = set(canonize(current))
+                        live  = set(live_peers)
+                        seeds = set(canonize(HARDCODED_SEEDS))
+                        union = {p for p in (known | live | seeds) if not is_self_peer(p[0])}
+                        clean_peers = sanitize_peer_list(list(union))
+
+                        # Only write if content changed
+                        if set(known) != set(clean_peers):
+                            save_json(PEERS_FILE, clean_peers)
+                            print(f"🌐 Peer discovery updated: {len(live)} live / {len(clean_peers)} known")
+                        else:
+                            print(f"🌐 Peer discovery: {len(live)} live / {len(clean_peers)} known (no change)")
+
+        except Exception as e:
+            print(f"🔍 Resilient peer discovery error: {e}")
 
 # Core blockchain functions
 def double_sha256(data: str) -> str:
@@ -3297,86 +3430,76 @@ def enhanced_consensus_check(peers: List[Tuple[str, int]], is_seed: bool = False
         
         return local_chain
     
-def single_peer_consensus_sync(peer: Tuple[str, int]) -> List[Dict]:
-    """Sync with a single authoritative peer"""
-    try:
-        ip, port = peer
-        if is_self_peer(ip):
-            print(f"🚫 Skipping self-peer sync: {ip}:{port}")
+def _single_allowed(ip, port):
+    return time.time() >= _single_sync_backoff.get((ip, port), 0)
+
+def _single_backoff(ip, port, secs=60):
+    _single_sync_backoff[(ip, port)] = time.time() + secs
+
+def single_peer_consensus_sync(peer: Tuple[str, int]) -> Optional[List[Dict]]:
+    """Sync from exactly one peer, but only if it's provably ahead. P2P ranges only."""
+    ip, port = peer
+    if is_self_peer(ip) or not _single_allowed(ip, port):
+        return None
+
+    # 1) Preflight: only if peer is ahead by height or same height w/ higher work
+    local_h, local_w = _local_tip_info()
+    info = get_peer_info_quick(ip, port, timeout=5)
+    if not info:
+        _single_backoff(ip, port, 60)
+        return None
+
+    if not (info['height'] > local_h or (info['height'] == local_h and info['total_work'] > local_w)):
+        # Not ahead -> don't fetch
+        return None
+
+    target_h = int(info['height'])
+    start = 0
+    blocks_out: List[Dict] = []
+
+    # 2) Sequential range fetches; one request per connection (no reuse)
+    while start < target_h:
+        end = min(start + CHAIN_SEGMENT_MAX, target_h)
+        s = create_safe_connection(ip, port, timeout=8)
+        if not s:
+            _single_backoff(ip, port, 60)
             return None
-        # Get their blockchain via API (port 5001)
-        if ip == '3.149.130.220':  # Only seed1 has API
-            api_port = 5001
-            try:
-                import requests
-                response = requests.get(f'http://{ip}:{api_port}/api/stats', timeout=30)
-                if response.status_code == 200:
-                    stats = response.json()
-                    target_height = stats.get('height', 0)
-
-                    if target_height > 0:
-                        # Download blockchain block by block
-                        blockchain = []
-                        print(f"📥 Downloading {target_height} blocks from {ip}...")
-
-                        for i in range(target_height):
-                            block_response = requests.get(f'http://{ip}:{api_port}/api/block/{i}', timeout=15)
-                            if block_response.status_code == 200:
-                                blockchain.append(block_response.json())
-                            else:
-                                print(f"Failed to download block {i}")
-                                break
-
-                        if len(blockchain) == target_height and is_valid_chain(blockchain):
-                            print(f"✅ Successfully downloaded {len(blockchain)} blocks from {ip}")
-                            return blockchain
-            except Exception as e:
-                print(f"API sync failed for {ip}: {e}")
-
-        # Fallback to P2P sync
-        sock = create_safe_connection(ip, 8334, timeout=30)  # P2P port
-        if not sock:
-            return None
-
         try:
-            request = {'type': 'get_chain'}
-            sock.sendall(json.dumps(request).encode())
+            s.settimeout(8)
+            req = {"type": "get_blocks_range", "data": {"start": start, "end": end}}
+            s.sendall(json.dumps(req).encode())
+            buf = s.recv(4 * 1024 * 1024)
+            if not buf:
+                _single_backoff(ip, port, 60)
+                return None
 
-            chunks = []
-            sock.settimeout(60)
+            msg = json.loads(buf.decode())
+            # Accept either 'blocks' or legacy 'data'
+            if msg.get("type") != "blocks_range":
+                _single_backoff(ip, port, 60)
+                return None
 
-            while True:
-                try:
-                    chunk = sock.recv(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                except socket.timeout:
-                    break
+            segment = msg.get("blocks") or msg.get("data") or []
+            if not isinstance(segment, list) or (not segment and start < target_h):
+                _single_backoff(ip, port, 60)
+                return None
 
-            if chunks:
-                data = b''.join(chunks)
-                message = json.loads(data.decode())
-
-                if message.get('type') == 'full_chain':
-                    peer_chain = message.get('data', [])
-
-                    if is_valid_chain(peer_chain):
-                        print(f"✅ Valid chain received from {ip}: {len(peer_chain)} blocks")
-                        return peer_chain
-
-            return None
-        except Exception as e:
-            print(f"Single-peer sync error: {e}")
+            blocks_out.extend(segment)
+            # Advance using server's 'to' if present, else our 'end'
+            start = (msg.get("to", end - 1)) + 1
+        except Exception:
+            _single_backoff(ip, port, 60)
             return None
         finally:
-            try:
-                sock.close()
-            except:
-                pass
-    except Exception as e:
-        print(f"Single-peer sync error: {e}")
-        return None
+            try: s.close()
+            except: pass
+
+    # 3) Adopt if strictly better by work (height breaks ties)
+    if blocks_out and is_valid_chain(blocks_out):
+        cand_w = calculate_chain_work(blocks_out)
+        if cand_w > local_w or (cand_w == local_w and len(blocks_out) - 1 > local_h):
+            return blocks_out
+    return None
 
 def enhanced_consensus_recovery(peers: List, is_seed: bool = False, max_failures: int = 5):
    """Hierarchical consensus with fallback recovery"""
@@ -3415,49 +3538,39 @@ def enhanced_consensus_recovery(peers: List, is_seed: bool = False, max_failures
            if attempt < max_failures - 1:
                time.sleep(2)  # Wait before retry
    
-   # Phase 2: Fallback to single-peer authority
+   # Phase 2: Fallback to single-peer **ahead** of us
    if not is_seed and peers:
-       print("🚨 Multi-peer consensus failed - attempting single-peer recovery")
-       
-       # Priority order: Try seeds first
-       priority_peers = []
-       regular_peers = []
-       
-       for peer in peers:
-           if isinstance(peer, (list, tuple)) and len(peer) >= 2:
-               peer_ip = peer[0]
-               peer_port = peer[1]
-               
-               if peer_ip in ['3.149.130.220', 'seed1.cyphermint.org']:
-                   priority_peers.insert(0, (peer_ip, peer_port))
-               elif peer_ip in ['35.81.59.214', '52.209.95.50', 'seed2.cyphermint.org', 'seed3.cyphermint.org']:
-                   priority_peers.append((peer_ip, peer_port))
-               else:
-                   regular_peers.append((peer_ip, peer_port))
-       
-       # Try single-peer sync in priority order
-       for peer in priority_peers + regular_peers:
-           try:
-               print(f"🔄 Attempting single-peer recovery from {peer[0]}:{peer[1]}")
-               single_peer_chain = single_peer_consensus_sync(peer)
-               
-               # Safe None check for single peer response
-               if single_peer_chain is None:
-                   print(f"⚠️ Single-peer sync from {peer[0]} returned None")
-                   continue
-                   
-               if not isinstance(single_peer_chain, list):
-                   print(f"⚠️ Single-peer sync from {peer[0]} returned invalid type: {type(single_peer_chain)}")
-                   continue
-               
-               if len(single_peer_chain) > 0:
-                   current_chain = load_json(BLOCKCHAIN_FILE, [])
-                   if len(single_peer_chain) > len(current_chain):
-                       print(f"✅ Successfully synced from {peer[0]} - height {len(single_peer_chain)}")
-                       return single_peer_chain
-                   
-           except Exception as e:
-               print(f"Single-peer sync failed for {peer[0]}: {e}")
+        print("🚨 Multi-peer consensus failed - attempting single-peer recovery")
+
+        local_h, local_w = _local_tip_info()
+        ahead_candidates: List[Tuple[str,int,int,int]] = []  # ip, port, h, work
+
+        # Probe peers for height/work and keep only those ahead
+        for p in peers:
+            if not (isinstance(p, (list, tuple)) and len(p) >= 2):
+                continue
+            ip, port = p[0], p[1]
+            if is_self_peer(ip):
+                continue
+            info = get_peer_info_quick(ip, port, timeout=5)
+            if not info:
+                continue
+            if info['height'] > local_h or (info['height'] == local_h and info['total_work'] > local_w):
+                ahead_candidates.append((ip, port, info['height'], info['total_work']))
+
+        if ahead_candidates:
+            # Prefer best-first; you can randomize within the top few to spread load
+            ahead_candidates.sort(key=lambda x: (x[2], x[3]), reverse=True)
+            # Optionally: random.shuffle(ahead_candidates[:3])
+            for ip, port, _, _ in ahead_candidates[:5]:
+                print(f"🔄 Attempting single-peer recovery from {ip}:{port}")
+                single_chain = single_peer_consensus_sync((ip, port))
+                if isinstance(single_chain, list) and single_chain and try_adopt_chain(single_chain):
+                    print(f"✅ Successfully synced from {ip} - height {len(single_chain)}")
+                    return single_chain
+        else:
+            print("↩️  No peers ahead; skipping single-peer recovery")
+
    
    # Phase 3: Return current chain if all else fails
    print("⚠️ All consensus methods failed - maintaining current chain")
@@ -4484,36 +4597,35 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
     # Register connection
     conn_id = register_connection(conn, addr)
     
-    # NEW: Automatic peer sharing on connection
     # NEW: Automatic peer sharing on connection (prefer LIVE peers)
-    if addr[0] not in ['127.0.0.1', '::1', 'localhost']:
-        with PEERS_LOCK:
-            our_peers = load_json(PEERS_FILE, [])
+    #if addr[0] not in ['127.0.0.1', '::1', 'localhost']:
+     #   with PEERS_LOCK:
+      #      our_peers = load_json(PEERS_FILE, [])
 
-        with LIVE_PEERS_LOCK:
-            live_list = list(LIVE_PEERS_CACHE)
+       # with LIVE_PEERS_LOCK:
+        #    live_list = list(LIVE_PEERS_CACHE)
 
         # prefer live; fall back to known
-        source = live_list if live_list else our_peers
+        #source = live_list if live_list else our_peers
 
         # Filter out self and the connecting peer
-        peers_to_share = []
-        for p in source:
-            if isinstance(p, (list, tuple)) and len(p) >= 2:
-                ip, prt = get_canonical_peer_address(p[0], p[1])
-                if not is_self_peer(ip) and ip != addr[0]:
-                    peers_to_share.append((ip, prt))
+        #peers_to_share = []
+        #for p in source:
+          #  if isinstance(p, (list, tuple)) and len(p) >= 2:
+         #       ip, prt = get_canonical_peer_address(p[0], p[1])
+          #      if not is_self_peer(ip) and ip != addr[0]:
+           #         peers_to_share.append((ip, prt))
 
-        if peers_to_share:
-            peer_share = {'type': 'peer_announcement', 'data': peers_to_share}
-            try:
-                conn.sendall(json.dumps(peer_share).encode())
-                print(f"📡 Automatically shared {len(peers_to_share)} peers (live-first) with {addr[0]}:{addr[1]}")
-            except:
-                pass
+        #if peers_to_share:
+         #   peer_share = {'type': 'peer_announcement', 'data': peers_to_share}
+          #  try:
+           #     conn.sendall(json.dumps(peer_share).encode())
+            #    print(f"📡 Automatically shared {len(peers_to_share)} peers (live-first) with {addr[0]}:{addr[1]}")
+            #except:
+             #   pass
 
     try:
-       conn.settimeout(30)
+       conn.settimeout(300)
        
        data = conn.recv(BUFFER_SIZE)
        if not data:
@@ -4524,26 +4636,50 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
        
        print(f"📡 Received {message_type} from {addr[0]}:{addr[1]} (client port: {addr[1]})")
        
-       if message_type == 'get_chain':
-           with BLOCKCHAIN_LOCK:
-               current_chain = load_json(BLOCKCHAIN_FILE, [])
-           print(f"📤 Sending blockchain (height: {len(current_chain)}) to {addr[0]}:{addr[1]}")
-           
-           response = {'type': 'full_chain', 'data': current_chain}
-           response_json = json.dumps(response)
-           response_bytes = response_json.encode()
-           
-           # Send in chunks
-           bytes_sent = 0
-           chunk_size = BUFFER_SIZE // 2
-           
-           while bytes_sent < len(response_bytes):
-               chunk = response_bytes[bytes_sent:bytes_sent + chunk_size]
-               conn.sendall(chunk)
-               bytes_sent += len(chunk)
-           
-           print(f"✅ Sent {len(response_bytes)} bytes to {addr[0]}:{addr[1]}")
+       if message_type == 'get_chain' or message_type == 'get_blockchain':
+            with BLOCKCHAIN_LOCK:
+                current_chain = load_json(BLOCKCHAIN_FILE, [])
+            
+            response = {'type': 'full_chain', 'data': current_chain}
+            response_json = json.dumps(response)
+            response_bytes = response_json.encode()
+            
+            # Send in chunks but DON'T close connection
+            print(f"📤 Sending {len(response_bytes)} bytes to {addr[0]}:{addr[1]}")
+            
+            # Send size first
+            size_bytes = struct.pack('!I', len(response_bytes))
+            conn.sendall(size_bytes)
+            
+            # Send data in chunks
+            bytes_sent = 0
+            chunk_size = 65536  # 64KB chunks
+            
+            while bytes_sent < len(response_bytes):
+                chunk = response_bytes[bytes_sent:bytes_sent + chunk_size]
+                conn.sendall(chunk)
+                bytes_sent += len(chunk)
+                
+            print(f"✅ Sent {bytes_sent} bytes successfully")
 
+            # Keep connection open for ACK or additional requests
+            conn.settimeout(10)
+            try:
+                ack = conn.recv(1024)
+                if ack:
+                    print(f"✅ Received ACK from {addr[0]}:{addr[1]}")
+            except socket.timeout:
+                pass
+
+       elif message_type == 'get_peers':
+                # Only send peers when explicitly requested
+                with PEERS_LOCK:
+                    peers = load_json(PEERS_FILE, [])
+                
+                response = {'type': 'peer_list', 'data': peers}
+                conn.sendall(json.dumps(response).encode())
+                print(f"📤 Sent peer list to {addr[0]}:{addr[1]}")
+            
        elif message_type == 'get_headers':
         # Send just headers
         start = message.get('data', {}).get('start_height', 0)
@@ -4561,47 +4697,7 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
                 snapshot = load_json(f'snapshot_{height}.json')
                 response = {'type': 'snapshot_response', 'data': snapshot}
                 conn.sendall(json.dumps(response).encode())
-           
-       elif message_type == 'get_peers':
-    # Load known peers
-        with PEERS_LOCK:
-            known_peers = load_json(PEERS_FILE, [])
-        known_can = []
-        for peer in known_peers:
-            if isinstance(peer, (list, tuple)) and len(peer) == 2:
-                known_can.append(get_canonical_peer_address(peer[0], peer[1]))
-
-        # Add the requesting peer to our known list BEFORE responding
-        req_peer = (addr[0], PEER_PORT)
-        if addr[0] not in ['127.0.0.1', '::1', 'localhost'] and not is_self_peer(addr[0]):
-            if req_peer not in known_can:
-                with PEERS_LOCK:
-                    known_can.append(req_peer)
-                    clean_known = sanitize_peer_list(known_can)
-                    save_json(PEERS_FILE, clean_known)
-                print(f"✅ Added server peer {req_peer[0]}:{req_peer[1]} to peer list")
-
-        # Build the LIVE peer list to broadcast
-        with LIVE_PEERS_LOCK:
-            live_list = list(LIVE_PEERS_CACHE)
-
-        live_can = []
-        for peer in live_list if live_list else known_can:
-            if isinstance(peer, (list, tuple)) and len(peer) == 2:
-                ip, prt = get_canonical_peer_address(peer[0], peer[1])
-                if not is_self_peer(ip):
-                    live_can.append((ip, prt))
-
-        response = {
-            'type': 'peer_list',
-            'data': live_can  # broadcast live peers so clients/explorer reflect reality
-            # NOTE: we could include an extra field if you ever need both:
-            # 'known': clean_known
-        }
-        conn.sendall(json.dumps(response).encode())
-        print(f"📤 Sent LIVE peer list ({len(live_can)} peers) to {addr[0]}:{addr[1]}")
-
-       
+                
        elif message_type == 'peer_announcement' or message_type == 'peer_exchange':
            # NEW: Handle incoming peer announcements
            new_peers = message.get('data', [])
@@ -4750,12 +4846,14 @@ def handle_peer_enhanced(conn, chain: List[Dict], addr):
                    print(f"✅ Checkpoint applied at height {height}")        
                
     except Exception as e:
-       print(f"❌ Peer handling error from {addr}: {e}")
+        print(f"❌ Peer handling error from {addr}: {e}")
     finally:
+        # Graceful shutdown
         try:
-           conn.close()
+            conn.shutdown(socket.SHUT_RDWR)
         except:
-           pass
+            pass
+        conn.close()
 
 def validate_and_add_block(new_block: Dict, blockchain: List[Dict]) -> bool:
     """Validate and add a new block with normalization and ancestor backfill."""
