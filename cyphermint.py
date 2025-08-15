@@ -443,6 +443,7 @@ def _initialize_local_ips() -> None:
             if 'external_ip' in node_data:
                 LOCAL_IPS.add(node_data['external_ip'])
 
+
 def is_self_peer(ip: str, port: int = PEER_PORT) -> bool:
     """Check if a peer address refers to ourselves"""
     # Check against known local IPs
@@ -534,6 +535,7 @@ def sanitize_peer_list(peers: Iterable[Tuple[str, int]]) -> List[Tuple[str, int]
 
 # Initialize local IPs immediately on import
 _initialize_local_ips()
+
 # Consensus thresholds
 CONSENSUS_THRESHOLD_SEED = 1
 CONSENSUS_THRESHOLD_PEER = 1
@@ -1098,7 +1100,7 @@ class DifficultyAdjustment:
         elif block_height <= 1500:
             return 0x1e0f0000
         elif block_height < 2016:
-            return 0x1e00ffff  # Bitcoin's original difficulty
+            return 0x1e00afff  # Bitcoin's original difficulty
 
         # 🔄 Full Bitcoin-style difficulty adjustment from block 2016 onward
         last_block = blocks[-1]
@@ -3914,11 +3916,19 @@ def start_mining(miner_address: str, seed: bool = False):
        print(f"📊 Network health: {consensus_analytics.get_network_health_score():.0f}/100")
        
        # Calculate difficulty for next block
-       if len(blockchain) % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 and len(blockchain) > 0:
-           new_bits = DifficultyAdjustment.calculate_next_difficulty(blockchain)
-           print(f"🎯 Difficulty adjustment at block {len(blockchain)}: {hex(new_bits)}")
+
+       # Calculate difficulty for next block
+       height = len(blockchain)
+
+       if height < DIFFICULTY_ADJUSTMENT_INTERVAL:
+            new_bits = DifficultyAdjustment.calculate_next_difficulty(blockchain)
+       elif height % DIFFICULTY_ADJUSTMENT_INTERVAL == 0:
+            new_bits = DifficultyAdjustment.calculate_next_difficulty(blockchain)
        else:
-           new_bits = previous_block.get('bits', MAX_TARGET)
+            # carry forward between retargets
+            new_bits = previous_block.get('bits', MAX_TARGET)
+
+       print(f"🎯 Difficulty at height {height}: {hex(int(new_bits))}")
        
        # Select transactions from mempool (simplified)
        selected_transactions = mempool[:10]  # Limit to 10 transactions
@@ -3935,8 +3945,9 @@ def start_mining(miner_address: str, seed: bool = False):
                    miner_address, previous_block, selected_transactions, 
                    new_bits, mining_cancelled, next_block_height
                )
+           
            except Exception as e:
-               mining_result['error'] = e
+             mining_result['error'] = e
        
        mining_thread = threading.Thread(target=background_mine, daemon=True)
        mining_thread.start()
@@ -4059,8 +4070,8 @@ def start_mining(miner_address: str, seed: bool = False):
                        print(f"🔄 Our solution was valid but network accepted different block")
        
        elif mining_result['error']:
-           print(f"❌ Mining error: {mining_result['error']}")
-           time.sleep(1)
+            print(f" Mining completed by another node: {mining_result['error']}")
+            time.sleep(1)
            
        
        # Continue to next block
