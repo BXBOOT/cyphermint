@@ -61,6 +61,9 @@ source venv/bin/activate # macOS/Linux
 
 ```bash
 pip install flask schedule requests
+pip install minupnpc
+pip install ecdsa
+(if you are having trouble with these check the python environment you are using and adjust if needed. Google can provide trouble shooting steps).
 ```
 
 ---
@@ -69,10 +72,8 @@ pip install flask schedule requests
 
 #### 1. Generate Wallet
 ```bash
-python3 cyphermint.py wallet --generate
+python3 cyphermint.py wallet --generate (Save this somewhere else also, just in case you lose your device. DO NOT SHARE PRIVATE KEY WITH ANYONE!!)
 ```
-```
-
 - This creates a secure `wallet.json` in your local folder.
 - DO NOT share your private key with anyone.
 - Your **public address** is safe to share for receiving CPM.
@@ -91,7 +92,9 @@ python3 cyphermint.py balance --address YOUR_ADDRESS
 
 #### 4. Send Transaction
 ```bash
-python3 cyphermint.py send --address FROM_ADDRESS --to TO_ADDRESS --amount X.X
+python3 cyphermint.py send --address FROM_ADDRESS  --to TO_ADDRESS --amount X.X
+(cyphermint will not allow you to send from an address you do not have the private ke for. the amount sends as you have it typed in ex 5.7892675 ot 0.6543 etc).
+(as with bitcoin, ethereum etc, as the blocks get mined, the transactions are completed. once sent there is no going back, make sure you have the correct address!!)
 ```
 
 
