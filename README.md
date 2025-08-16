@@ -8,17 +8,17 @@ I'm a single developer, and this project has been a massive effort—thank you f
 
 # CypherMint (CPM)
 
-## Cryptocurrency Demonstrating Human Crypto Vulnerabilities
+## Cryptocurrency Demonstrating Possible Human Crypto Vulnerabilities in coins like earll bitcoin development etc. 
 
 **PRODUCTION MODE** - Full Bitcoin Style difficulty
 
 CypherMint is a complete Bitcoin-style cryptocurrency (You cannot send or receive bitcoin to these addresses so dont try or you will lose what you send) that demonstrates how human behavioral patterns create vulnerabilities in cryptographic key generation.
 
+### Security Notice
+**ONLY THE GENESIS BLOCK** uses predictable key generation to demonstrate the vulnerability. Solving the puzzle for the genesis block does not get you access to the full chain or other wallets!! All subsequent addresses use cryptographically secure random generation.
+
 ### Purpose
 This project proves that human weakness in cryptocurrency key generation exists **before** quantum computing threats, using a live, working blockchain.
-
-### Security Notice
-**Only the Genesis block** uses predictable key generation to demonstrate the vulnerability. All subsequent addresses use cryptographically secure random generation.
 
 ### Network Details
 - **Total Supply**: 21,000,000 CPM
